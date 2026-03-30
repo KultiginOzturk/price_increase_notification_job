@@ -1,5 +1,5 @@
-import { closePool } from '../../lib/postgres.js';
-import { runDuePrePushNotifications } from '../../services/priceIncreaseNotificationService.js';
+import { closePool } from './lib/postgres.js';
+import { runDuePrePushNotifications } from './services/priceIncreaseNotificationService.js';
 
 function parseClientList(rawValue) {
     if (!rawValue) return null;

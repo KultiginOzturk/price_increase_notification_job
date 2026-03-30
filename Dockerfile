@@ -5,8 +5,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-COPY server/ ./server/
+COPY . .
 
 ENV NODE_ENV=production
 
-CMD ["node", "server/jobs/price_increase_notification_job/index.js"]
+CMD ["node", "index.js"]

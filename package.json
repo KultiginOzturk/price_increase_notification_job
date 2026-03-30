@@ -1,0 +1,20 @@
+{
+  "name": "price-increase-notification-job",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js && node --check main.js && node --check lib/postgres.js && node --check services/priceIncreaseNotificationService.js && node --check services/planV2PricePushService.js && node --check services/emailService.js && node --check config/tables.js && node --check utils/bigquery.js && node --check utils/repricingScheduling.js && node --check routes/planV2/timing.js"
+  },
+  "dependencies": {
+    "@google-cloud/bigquery": "^8.1.1",
+    "dotenv": "^17.2.3",
+    "mailersend": "^2.6.0",
+    "pg": "^8.16.3"
+  }
+}
