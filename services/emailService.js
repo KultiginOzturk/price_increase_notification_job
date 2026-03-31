@@ -13,14 +13,47 @@ const FROM_EMAIL = process.env.MAILERSEND_FROM_EMAIL || 'reports@pestnotificatio
 const FROM_NAME = process.env.MAILERSEND_FROM_NAME || 'Pest Analytics Reports';
 // Domain for price-increase notification "from" address (client@domain). Set for testing to a verified MailerSend test domain.
 const NOTIFICATION_FROM_DOMAIN = process.env.MAILERSEND_FROM_DOMAIN || 'pestnotifications.com';
+const MAILERSEND_MAX_REQUESTS_PER_MINUTE = Math.max(1, Number(process.env.MAILERSEND_MAX_REQUESTS_PER_MINUTE) || 10);
+const MAILERSEND_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
 let mailerSend = null;
+const mailerSendRequestTimestamps = [];
 
 if (MAILERSEND_API_KEY) {
   mailerSend = new MailerSend({ apiKey: MAILERSEND_API_KEY });
   console.log('[EmailService] MailerSend initialized');
 } else {
   console.warn('[EmailService] MAILERSEND_API_KEY not set - emails will be logged only');
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitForMailerSendRateLimitSlot() {
+  while (true) {
+    const now = Date.now();
+
+    while (
+      mailerSendRequestTimestamps.length > 0 &&
+      now - mailerSendRequestTimestamps[0] >= MAILERSEND_RATE_LIMIT_WINDOW_MS
+    ) {
+      mailerSendRequestTimestamps.shift();
+    }
+
+    if (mailerSendRequestTimestamps.length < MAILERSEND_MAX_REQUESTS_PER_MINUTE) {
+      mailerSendRequestTimestamps.push(now);
+      return;
+    }
+
+    const oldestTimestamp = mailerSendRequestTimestamps[0];
+    const waitMs = Math.max(250, MAILERSEND_RATE_LIMIT_WINDOW_MS - (now - oldestTimestamp) + 50);
+    console.log(`[EmailService] Rate limit reached, waiting ${waitMs}ms before next MailerSend request`);
+    await sleep(waitMs);
+  }
+}
+
+async function sendMailerSendRequest(emailParams) {
+  await waitForMailerSendRateLimitSlot();
+  return mailerSend.email.send(emailParams);
 }
 
 /**
@@ -119,7 +152,7 @@ This is an automated email from Pest Analytics.
       .setText(textContent)
       .setHtml(htmlContent);
 
-    const response = await mailerSend.email.send(emailParams);
+    const response = await sendMailerSendRequest(emailParams);
     const messageId = response?.messageId || response?.message_id || 'unknown';
 
     console.log(`[EmailService] Email sent successfully to ${recipients.length} recipients. MessageId: ${messageId}`);
@@ -199,7 +232,7 @@ export async function sendReportFailureEmail({ recipients, reportName, client, e
       .setSubject(subject)
       .setHtml(htmlContent);
 
-    await mailerSend.email.send(emailParams);
+    await sendMailerSendRequest(emailParams);
     return { success: true };
   } catch (error) {
     console.error('[EmailService] Failed to send failure notification:', error.message);
@@ -272,8 +305,7 @@ function billingFrequencyToLabel(freq, servicesPerYear = null) {
     if (servicesPerYear === 2)                           return { label: 'every 6 months', chargesPerYear: 2 };
   }
 
-  // Ultimate fallback
-  return { label: 'per month', chargesPerYear: 12 };
+  return { label: 'per service', chargesPerYear: null };
 }
 
 /**
@@ -284,7 +316,7 @@ const DEFAULT_TEMPLATE = {
   notification_subject: 'Your Service Summary - {company_name}',
   notification_greeting: 'Hi {first_name},',
   notification_body_single: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about an upcoming service price change for {account_name}. Your service will increase by {increase} {time_unit}, effective {effective_date}.\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
-  notification_body_multi: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about an upcoming service price change for {account_name}. Your services will increase by approximately {monthly_increase} per month, effective {effective_date}.\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
+  notification_body_multi: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about upcoming service price changes for {account_name}, effective {effective_date}.\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
   notification_closing: "We're always here if you have any questions — feel free to reach out to us at any time.\n\nThank you for being a valued part of the {company_name} family.\n\nWarm regards,\nThe {company_name} Team",
   notification_footer: 'You are receiving this because you are a customer of {company_name}.',
   notification_header_color: '#0f172a',
@@ -350,29 +382,10 @@ export function computeEmailVariables({
       },
     };
   } else {
-    // Multi subscription mode (2+ non-zero subs, or 0 subs edge case)
-    let annualIncrease = 0;
-    for (const svc of nonZeroServices) {
-      const inc = Number(svc.increaseAmount) || 0;
-      const freq = svc.billingFrequency ?? svc.billing_frequency;
-      let spy = Number(svc.servicesPerYear ?? svc.services_per_year) || 0;
-
-      // Derive servicesPerYear from billingFrequency if missing
-      if (!spy || spy <= 0) {
-        const billing = billingFrequencyToLabel(freq);
-        spy = billing.chargesPerYear || 12; // fallback to monthly
-        console.warn(`[EmailService] servicesPerYear missing for service ${svc.serviceTypeName || 'unknown'}, derived ${spy} from billing_frequency ${freq}`);
-      }
-
-      annualIncrease += inc * spy;
-    }
-    const monthlyIncrease = annualIncrease / 12;
-
     return {
       mode: 'multi',
       variables: {
         ...baseVars,
-        monthly_increase: formatUSD(monthlyIncrease),
         subscription_count: String(nonZeroServices.length),
       },
     };
@@ -570,7 +583,7 @@ To unsubscribe: ${unsubscribeUrl}
   const bccList = parseCcList(templateConfig.notification_bcc);
 
   const sendWithParams = async (params) => {
-    const response = await mailerSend.email.send(params);
+    const response = await sendMailerSendRequest(params);
     const messageId = response?.body?.['x-message-id'] || response?.headers?.['x-message-id'] || response?.messageId || 'unknown';
     return messageId;
   };

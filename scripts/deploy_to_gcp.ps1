@@ -38,8 +38,5 @@ gcloud run jobs deploy $JOB_NAME `
   --task-timeout 15m `
   --max-retries 1
 
-Write-Host "Executing Cloud Run Job once for validation"
-gcloud run jobs execute $JOB_NAME --project $PROJECT_ID --region $REGION
-
 Write-Host "Done. Check logs with:"
 Write-Host "gcloud logging read `"resource.type=cloud_run_job`" --project $PROJECT_ID --limit 50 --freshness 6h"
