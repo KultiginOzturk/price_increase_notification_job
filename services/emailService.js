@@ -316,7 +316,7 @@ const DEFAULT_TEMPLATE = {
   notification_subject: 'Your Service Summary - {company_name}',
   notification_greeting: 'Hi {first_name},',
   notification_body_single: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about an upcoming service price change for {account_name}. Your service will increase by {increase} {time_unit}, effective {effective_date}.\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
-  notification_body_multi: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about upcoming service price changes for {account_name}, effective {effective_date}.\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
+  notification_body_multi: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about an upcoming service price change for {account_name}. Your services will increase by approximately {monthly_increase} per month, effective {effective_date}.\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
   notification_closing: "We're always here if you have any questions — feel free to reach out to us at any time.\n\nThank you for being a valued part of the {company_name} family.\n\nWarm regards,\nThe {company_name} Team",
   notification_footer: 'You are receiving this because you are a customer of {company_name}.',
   notification_header_color: '#0f172a',
@@ -382,10 +382,29 @@ export function computeEmailVariables({
       },
     };
   } else {
+    // Multi subscription mode (2+ non-zero subs, or 0 subs edge case)
+    let annualIncrease = 0;
+    for (const svc of nonZeroServices) {
+      const inc = Number(svc.increaseAmount) || 0;
+      const freq = svc.billingFrequency ?? svc.billing_frequency;
+      let spy = Number(svc.servicesPerYear ?? svc.services_per_year) || 0;
+
+      // Derive servicesPerYear from billingFrequency if missing
+      if (!spy || spy <= 0) {
+        const billing = billingFrequencyToLabel(freq);
+        spy = billing.chargesPerYear || 12; // fallback to monthly
+        console.warn(`[EmailService] servicesPerYear missing for service ${svc.serviceTypeName || 'unknown'}, derived ${spy} from billing_frequency ${freq}`);
+      }
+
+      annualIncrease += inc * spy;
+    }
+    const monthlyIncrease = annualIncrease / 12;
+
     return {
       mode: 'multi',
       variables: {
         ...baseVars,
+        monthly_increase: formatUSD(monthlyIncrease),
         subscription_count: String(nonZeroServices.length),
       },
     };

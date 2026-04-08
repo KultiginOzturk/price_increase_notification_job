@@ -438,6 +438,7 @@ export async function fetchNotificationConfig(client) {
         FROM ${INPUTS.clientSettings}
         WHERE client = @client
           AND setting_key LIKE 'notification_%'
+          AND is_current = TRUE
     `, { client }, 'price-increase-notify-config');
 
     const settings = new Map(rows.map((row) => [row.setting_key, row.value_string]));
@@ -448,7 +449,7 @@ export async function fetchNotificationConfig(client) {
     let fromEmail = null;
     if (customAddress) {
         const localPart = customAddress.includes('@') ? customAddress.split('@')[0] : customAddress;
-        fromEmail = `${localPart}@${customDomain || process.env.MAILERSEND_FROM_DOMAIN || 'pestanalytics.com'}`;
+        fromEmail = `${localPart}@${customDomain || process.env.MAILERSEND_FROM_DOMAIN || 'pestnotifications.com'}`;
     }
 
     // Build templateConfig from all notification_* settings

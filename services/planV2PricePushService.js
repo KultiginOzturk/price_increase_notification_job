@@ -2,6 +2,7 @@ import { query as pgQuery } from '../lib/postgres.js';
 import { getRCP, SHARED } from '../config/tables.js';
 import { runQuery } from '../utils/bigquery.js';
 import { getMonthAbbreviation } from '../utils/repricingScheduling.js';
+import { calculatePushArv, calculatePushServiceCharge } from '../utils/pricePushMath.js';
 
 const EFFECTIVE_PERIOD_PATTERN = /^\d{4}-\d{2}$/;
 
@@ -37,7 +38,7 @@ export function getEffectivePeriodMeta(effectivePeriod) {
 
 export async function getPublishedPlanV2(client) {
     const result = await pgQuery(`
-        SELECT id, company_key, status, philosophy, published_at
+        SELECT id, company_key, status, philosophy, published_at, last_generated_at, speed_limit_global_pct
         FROM planv2_plan
         WHERE company_key = $1
           AND status = 'published'
@@ -283,7 +284,8 @@ export async function buildPlanV2PricePushSource({ client, effectivePeriod }) {
     for (const row of subscriptionResult.rows) {
         const meta = subscriptionMeta.get(String(row.subscription_id)) || {};
         const oldServiceCharge = Number(meta.recurring_price ?? row.current_price) || 0;
-        const newServiceCharge = Number(row.new_price) || 0;
+        const calculatedIncreasePct = Number(row.increase_pct) || 0;
+        const newServiceCharge = calculatePushServiceCharge(oldServiceCharge, calculatedIncreasePct);
         const recurringTicketId = extractSimpleId(meta.recurring_ticket_id);
         if (!recurringTicketId || oldServiceCharge <= 0 || newServiceCharge <= 0) {
             continue;
@@ -293,9 +295,11 @@ export async function buildPlanV2PricePushSource({ client, effectivePeriod }) {
         const oldArv = Number(meta.annual_revenue)
             || (servicesPerYear > 0 ? oldServiceCharge * servicesPerYear : 0);
         const annualIncrease = Number(row.increase_dollar_annual) || 0;
-        const newArv = oldArv > 0 && annualIncrease !== 0
-            ? oldArv + annualIncrease
-            : (oldServiceCharge > 0 ? oldArv * (newServiceCharge / oldServiceCharge) : 0);
+        const newArv = calculatePushArv({
+            oldArv,
+            annualIncrease,
+            increasePct: calculatedIncreasePct,
+        });
 
         subscriptions.push({
             accountDecisionId: Number(row.account_decision_id),
@@ -309,7 +313,7 @@ export async function buildPlanV2PricePushSource({ client, effectivePeriod }) {
             newArv: Number.isFinite(newArv) ? newArv : 0,
             oldProductionValue: Number(meta.old_production_value) || oldArv,
             subscriptionMarginPct: Number(meta.subscription_margin_pct) || 0,
-            calculatedIncreasePct: Number(row.increase_pct) || 0,
+            calculatedIncreasePct,
             serviceTypeName: meta.service_type_name || row.service_type_name || 'Unknown',
             isActive: meta.is_active === null || meta.is_active === undefined ? true : Boolean(meta.is_active),
             annualIncrease,
