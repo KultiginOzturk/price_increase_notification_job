@@ -785,6 +785,7 @@ export async function runDuePrePushNotifications({
     baseUrl,
     sentBy = 'cloud_run_job',
     testRecipient = null,
+    sendLimit = null,
 } = {}) {
     const normalizedTargetDate = normalizeDateOnly(targetDate) || new Date().toISOString().slice(0, 10);
     const trimmedBaseUrl = typeof baseUrl === 'string' ? baseUrl.trim().replace(/\/+$/, '') : '';
@@ -833,9 +834,18 @@ export async function runDuePrePushNotifications({
             targets,
         });
         const senderConfig = await fetchNotificationConfig(duePeriod.client);
-        const selectedIds = eligibility.targets
+        let selectedIds = eligibility.targets
             .filter((target) => target.eligibility === 'eligible')
             .map((target) => target.selectionId);
+
+        if (sendLimit != null) {
+            const remaining = sendLimit - summary.sent;
+            if (remaining <= 0) {
+                selectedIds = [];
+            } else {
+                selectedIds = selectedIds.slice(0, remaining);
+            }
+        }
 
         const periodSummary = {
             ...duePeriod,

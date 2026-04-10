@@ -350,6 +350,29 @@ export function computeEmailVariables({
     return inc > 0;
   });
 
+  // Derive effective_month (e.g., "April 2026") from effectiveDate
+  const formatMonth = (value) => {
+    if (!value) return '';
+    const parsed = new Date(`${value}T00:00:00`);
+    if (Number.isNaN(parsed.getTime())) return value;
+    return parsed.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  };
+
+  // Build a plain-text service list (one line per service with new price)
+  const buildServiceList = (svcs) => {
+    if (!svcs || svcs.length === 0) return '';
+    return svcs
+      .filter(s => (Number(s.increaseAmount) || 0) > 0)
+      .map(s => {
+        const billing = billingFrequencyToLabel(
+          s.billingFrequency ?? s.billing_frequency,
+          s.servicesPerYear ?? s.services_per_year
+        );
+        return `${s.serviceTypeName}: ${formatUSD(Number(s.newPrice) || 0)} ${billing.label}`;
+      })
+      .join('\n');
+  };
+
   // Base variables available in all templates
   const baseVars = {
     first_name: firstName || (customerName ? customerName.split(' ')[0] : ''),
@@ -357,6 +380,8 @@ export function computeEmailVariables({
     account_name: accountName || '',
     company_name: companyName || templateConfig.notification_from_name || '',
     effective_date: formatDate(effectiveDate),
+    effective_month: formatMonth(effectiveDate),
+    service_list: buildServiceList(nonZeroServices),
     address_list: '', // Future: populated when address pipeline is complete
     // Client business contact variables (from settings)
     client_email: templateConfig.notification_client_email || '',

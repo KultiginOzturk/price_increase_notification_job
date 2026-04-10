@@ -33,10 +33,12 @@ async function main() {
     const baseUrl = process.env.APP_URL || '';
     const sentBy = process.env.NOTIFICATION_SENT_BY || 'cloud_run_job';
     const testRecipient = process.env.NOTIFICATION_TEST_RECIPIENT || null;
+    const sendLimit = process.env.NOTIFICATION_LIMIT ? parseInt(process.env.NOTIFICATION_LIMIT, 10) : null;
 
     console.log(
         `[price-increase-notification-job] Starting targetDate=${targetDate || 'today'} ` +
-        `clients=${clients ? clients.join(',') : 'all'} testRecipient=${testRecipient || 'none'}`
+        `clients=${clients ? clients.join(',') : 'all'} testRecipient=${testRecipient || 'none'} ` +
+        `sendLimit=${sendLimit ?? 'none'}`
     );
 
     const summary = await runDuePrePushNotifications({
@@ -45,6 +47,7 @@ async function main() {
         baseUrl,
         sentBy,
         testRecipient,
+        sendLimit,
     });
 
     for (const period of summary.periods) {
