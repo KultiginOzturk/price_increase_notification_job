@@ -809,6 +809,7 @@ export async function runDuePrePushNotifications({
         unsubscribed: 0,
         alreadySent: 0,
         periods: [],
+        records: [],
     };
 
     for (const duePeriod of duePeriods) {
@@ -867,29 +868,62 @@ export async function runDuePrePushNotifications({
         summary.alreadySent += eligibility.summary.alreadySent;
         summary.processedPeriodCount++;
 
-        if (selectedIds.length === 0) {
-            summary.periods.push(periodSummary);
-            continue;
+        const selectedIdSet = new Set(selectedIds.map(String));
+
+        let result = { details: [] };
+        if (selectedIds.length > 0) {
+            result = await sendNotificationTargets({
+                client: duePeriod.client,
+                mode: PRE_PUSH_MODE,
+                targets: eligibility.targets,
+                selectedIds,
+                sentBy,
+                baseUrl: trimmedBaseUrl,
+                senderConfig,
+                testRecipient,
+            });
+
+            periodSummary.sent = result.sent;
+            periodSummary.failed = result.failed;
+            periodSummary.totalSelected = result.total;
+            periodSummary.status = result.failed > 0 ? 'completed_with_failures' : 'completed';
+
+            summary.sent += result.sent;
+            summary.failed += result.failed;
         }
 
-        const result = await sendNotificationTargets({
-            client: duePeriod.client,
-            mode: PRE_PUSH_MODE,
-            targets: eligibility.targets,
-            selectedIds,
-            sentBy,
-            baseUrl: trimmedBaseUrl,
-            senderConfig,
-            testRecipient,
-        });
+        const sendStatusBySelectionId = new Map(
+            (result.details || []).map((d) => [String(d.selectionId), d])
+        );
 
-        periodSummary.sent = result.sent;
-        periodSummary.failed = result.failed;
-        periodSummary.totalSelected = result.total;
-        periodSummary.status = result.failed > 0 ? 'completed_with_failures' : 'completed';
+        for (const target of eligibility.targets) {
+            const totalIncrease = target.services.reduce((sum, s) => sum + (Number(s.increaseAmount) || 0), 0);
+            let sendStatus;
+            if (selectedIdSet.has(String(target.selectionId))) {
+                const detail = sendStatusBySelectionId.get(String(target.selectionId));
+                sendStatus = detail ? detail.status : 'not_sent';
+                if (detail?.error) sendStatus = `${sendStatus}: ${detail.error}`;
+            } else if (target.eligibility !== 'eligible') {
+                sendStatus = `skipped_${target.eligibility}`;
+            } else {
+                sendStatus = 'skipped_send_limit';
+            }
 
-        summary.sent += result.sent;
-        summary.failed += result.failed;
+            summary.records.push({
+                accountId: target.masterAccountId,
+                accountName: target.accountName,
+                customerName: target.customerName,
+                email: target.email || '',
+                eligibility: target.eligibility,
+                effectivePeriod: duePeriod.effectivePeriod,
+                effectiveDate: duePeriod.effectiveDate,
+                serviceCount: target.services.length,
+                totalIncrease: totalIncrease.toFixed(2),
+                services: target.services.map(s => `${s.serviceTypeName}: $${Number(s.currentPrice).toFixed(2)} -> $${Number(s.newPrice).toFixed(2)}`).join(' | '),
+                sendStatus,
+            });
+        }
+
         summary.periods.push(periodSummary);
     }
 

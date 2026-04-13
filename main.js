@@ -1,5 +1,41 @@
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+import XLSX from 'xlsx';
 import { closePool } from './lib/postgres.js';
 import { runDuePrePushNotifications } from './services/priceIncreaseNotificationService.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const EXCEL_COLUMNS = [
+    ['accountId', 'Account ID'],
+    ['accountName', 'Account Name'],
+    ['customerName', 'Customer Name'],
+    ['email', 'Email'],
+    ['eligibility', 'Eligibility for email'],
+    ['effectivePeriod', 'Effective Period'],
+    ['effectiveDate', 'Effective Date'],
+    ['serviceCount', 'Service Count'],
+    ['totalIncrease', 'Total increase $'],
+    ['services', 'Services'],
+    ['sendStatus', 'Send Status'],
+];
+
+function writeSendReport(records, clients) {
+    if (!records || records.length === 0) return;
+    const rows = records.map((r) => {
+        const out = {};
+        for (const [key, header] of EXCEL_COLUMNS) out[header] = r[key] ?? '';
+        return out;
+    });
+    const ws = XLSX.utils.json_to_sheet(rows, { header: EXCEL_COLUMNS.map(([, h]) => h) });
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Send Report');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const suffix = clients ? clients.join('_') : 'all';
+    const outPath = join(__dirname, `send-report-${suffix}-${stamp}.xlsx`);
+    XLSX.writeFile(wb, outPath);
+    console.log(`[price-increase-notification-job] Wrote send report: ${outPath}`);
+}
 
 function parseClientList(rawValue) {
     if (!rawValue) return null;
@@ -53,6 +89,8 @@ async function main() {
     for (const period of summary.periods) {
         logPeriodSummary(period);
     }
+
+    writeSendReport(summary.records, clients);
 
     console.log(
         `[price-increase-notification-job] Complete targetDate=${summary.targetDate} ` +
