@@ -136,6 +136,7 @@ const fetchCustomerContacts = async (client, customerIds) => {
         SELECT
             CAST(customer_id AS STRING) AS customer_id,
             email,
+            billing_email,
             first_name,
             last_name,
             company_name
@@ -144,7 +145,10 @@ const fetchCustomerContacts = async (client, customerIds) => {
           AND CAST(customer_id AS STRING) IN UNNEST(@customerIds)
     `, { client, customerIds: dedupedCustomerIds }, 'price-increase-notify-customer-contacts');
 
-    return new Map(rows.map((row) => [String(row.customer_id), row]));
+    return new Map(rows.map((row) => [String(row.customer_id), {
+        ...row,
+        email: normalizeEmail(row.billing_email) || normalizeEmail(row.email) || null,
+    }]));
 };
 
 const pickPrimaryContact = (customerIds, contactsById) => {
