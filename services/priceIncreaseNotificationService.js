@@ -11,8 +11,10 @@ const POST_PUSH_MODE = 'post_push';
 
 const normalizeEmail = (value) => {
     if (typeof value !== 'string') return null;
-    const trimmed = value.trim().toLowerCase();
-    return trimmed || null;
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const candidates = value.split(/[;,]/).map((part) => part.trim().toLowerCase()).filter(Boolean);
+    const firstValid = candidates.find((candidate) => emailRegex.test(candidate));
+    return firstValid || candidates[0] || null;
 };
 
 const escapeSqlString = (value) => String(value).replace(/'/g, "''");
