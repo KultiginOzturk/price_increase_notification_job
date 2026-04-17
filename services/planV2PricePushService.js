@@ -285,7 +285,7 @@ export async function buildPlanV2PricePushSource({ client, effectivePeriod }) {
         const meta = subscriptionMeta.get(String(row.subscription_id)) || {};
         const oldServiceCharge = Number(meta.recurring_price ?? row.current_price) || 0;
         const calculatedIncreasePct = Number(row.increase_pct) || 0;
-        const newServiceCharge = calculatePushServiceCharge(oldServiceCharge, calculatedIncreasePct);
+        const newServiceCharge = Number(row.new_price) || 0;
         const recurringTicketId = extractSimpleId(meta.recurring_ticket_id);
         if (!recurringTicketId || oldServiceCharge <= 0 || newServiceCharge <= 0) {
             continue;

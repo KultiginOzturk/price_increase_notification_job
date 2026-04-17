@@ -17,7 +17,9 @@ const normalizeEmail = (value) => {
     return firstValid || candidates[0] || null;
 };
 
-const escapeSqlString = (value) => String(value).replace(/'/g, "''");
+const escapeSqlString = (value) => String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'");
 
 const toSqlString = (value) => {
     if (value === null || value === undefined || value === '') return 'NULL';
