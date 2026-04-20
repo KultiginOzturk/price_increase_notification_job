@@ -1,5 +1,6 @@
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import readline from 'readline';
 import XLSX from 'xlsx';
 import { closePool } from './lib/postgres.js';
 import { runDuePrePushNotifications } from './services/priceIncreaseNotificationService.js';
@@ -63,6 +64,72 @@ function logPeriodSummary(period) {
     console.log(`[price-increase-notification-job] ${detailParts.join(' ')}`);
 }
 
+function promptYesNo(message) {
+    return new Promise((resolve) => {
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        rl.question(`${message} [y/N] `, (answer) => {
+            rl.close();
+            resolve(/^y(es)?$/i.test(String(answer).trim()));
+        });
+    });
+}
+
+function formatPreflightSection(title, body) {
+    const bar = '─'.repeat(60);
+    return `\n${bar}\n${title}\n${bar}\n${body}\n`;
+}
+
+async function interactivePreflight({ period, senderConfig, counts, sample, sanity }) {
+    const periodHeader = `Client: ${period.client}  |  Effective period: ${period.effectivePeriod}  |  Effective date: ${period.effectiveDate || 'n/a'}`;
+    console.log(`\n\n════════════════════════════════════════════════════════════`);
+    console.log(`PREFLIGHT — ${periodHeader}`);
+    console.log(`════════════════════════════════════════════════════════════`);
+
+    // (1) Sender identity
+    console.log(formatPreflightSection('1/4  SENDER IDENTITY', [
+        `From email:  ${senderConfig.fromEmail || '(fallback to env default)'}`,
+        `From name:   ${senderConfig.fromName || '(fallback to client name)'}`,
+        `Reply-to:    ${senderConfig.replyTo || '(none)'}`,
+    ].join('\n')));
+    if (!(await promptYesNo('Sender identity looks correct — proceed?'))) return false;
+
+    // (2) Counts
+    console.log(formatPreflightSection('2/4  RECIPIENT COUNTS', [
+        `Will send to:      ${counts.toSend}`,
+        `Eligible total:    ${counts.eligible}`,
+        `No email on file:  ${counts.noEmail}`,
+        `Unsubscribed:      ${counts.unsubscribed}`,
+        `Already sent:      ${counts.alreadySent}`,
+    ].join('\n')));
+    if (!(await promptYesNo('Counts look correct — proceed?'))) return false;
+
+    // (3) Sample rendered email
+    const r = sample?.rendered;
+    const sampleBody = r
+        ? [
+              `Recipient:  ${r.recipient}${r.recipientName ? ` (${r.recipientName})` : ''}`,
+              `From:       ${r.senderName} <${r.senderEmail}>`,
+              `Reply-to:   ${r.replyTo || '(none)'}`,
+              `Subject:    ${r.subject}`,
+              '',
+              '--- TEXT BODY ---',
+              r.textContent,
+              '--- END BODY ---',
+          ].join('\n')
+        : '(no sample rendered — nothing to show)';
+    console.log(formatPreflightSection(`3/4  SAMPLE EMAIL (acct ${sample?.target?.masterAccountId ?? 'n/a'})`, sampleBody));
+    if (!(await promptYesNo('Sample email looks correct — proceed?'))) return false;
+
+    // (4) Sanity checks
+    const sanityBody = sanity.warnings.length === 0
+        ? 'All automated checks passed.'
+        : ['Warnings:', ...sanity.warnings.map((w) => `  - ${w}`)].join('\n');
+    console.log(formatPreflightSection('4/4  AUTOMATED SANITY CHECKS', sanityBody));
+    if (!(await promptYesNo('Sanity checks acceptable — proceed with send?'))) return false;
+
+    return true;
+}
+
 async function main() {
     const targetDate = process.env.NOTIFICATION_TARGET_DATE || null;
     const clients = parseClientList(process.env.NOTIFICATION_CLIENTS || process.env.CLIENT || null);
@@ -70,11 +137,12 @@ async function main() {
     const sentBy = process.env.NOTIFICATION_SENT_BY || 'cloud_run_job';
     const testRecipient = process.env.NOTIFICATION_TEST_RECIPIENT || null;
     const sendLimit = process.env.NOTIFICATION_LIMIT ? parseInt(process.env.NOTIFICATION_LIMIT, 10) : null;
+    const autoConfirm = /^(1|true|yes)$/i.test(String(process.env.NOTIFICATION_AUTO_CONFIRM || ''));
 
     console.log(
         `[price-increase-notification-job] Starting targetDate=${targetDate || 'today'} ` +
         `clients=${clients ? clients.join(',') : 'all'} testRecipient=${testRecipient || 'none'} ` +
-        `sendLimit=${sendLimit ?? 'none'}`
+        `sendLimit=${sendLimit ?? 'none'} autoConfirm=${autoConfirm}`
     );
 
     const summary = await runDuePrePushNotifications({
@@ -84,6 +152,7 @@ async function main() {
         sentBy,
         testRecipient,
         sendLimit,
+        preflight: autoConfirm ? null : interactivePreflight,
     });
 
     for (const period of summary.periods) {

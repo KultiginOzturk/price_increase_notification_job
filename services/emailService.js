@@ -282,30 +282,30 @@ function resolveTemplateVariables(template, variables) {
  */
 function billingFrequencyToLabel(freq, servicesPerYear = null) {
   const known = {
-    30:  { label: 'per month',          chargesPerYear: 12 },
-    28:  { label: 'every 4 weeks',       chargesPerYear: 13 },
-    60:  { label: 'every other month',   chargesPerYear: 6 },
-    90:  { label: 'per quarter',         chargesPerYear: 4 },
-    180: { label: 'every 6 months',      chargesPerYear: 2 },
-    360: { label: 'per year',            chargesPerYear: 1 },
+    30:  { label: 'per month',          adjective: 'monthly',       chargesPerYear: 12 },
+    28:  { label: 'every 4 weeks',      adjective: 'every 4 weeks', chargesPerYear: 13 },
+    60:  { label: 'every other month',  adjective: 'bi-monthly',    chargesPerYear: 6 },
+    90:  { label: 'per quarter',        adjective: 'quarterly',     chargesPerYear: 4 },
+    180: { label: 'every 6 months',     adjective: 'semi-annually', chargesPerYear: 2 },
+    360: { label: 'per year',           adjective: 'annually',      chargesPerYear: 1 },
   };
 
   if (freq != null && known[freq]) return known[freq];
 
   // Per-visit codes
   if (freq === -1 || freq === 0) {
-    return { label: 'per visit', chargesPerYear: servicesPerYear || null };
+    return { label: 'per visit', adjective: 'per visit', chargesPerYear: servicesPerYear || null };
   }
 
   // Fallback: try to derive from servicesPerYear
   if (servicesPerYear && servicesPerYear > 0) {
-    if (servicesPerYear >= 11 && servicesPerYear <= 13)  return { label: 'per month', chargesPerYear: servicesPerYear };
-    if (servicesPerYear >= 3 && servicesPerYear <= 4)    return { label: 'per quarter', chargesPerYear: servicesPerYear };
-    if (servicesPerYear === 1)                           return { label: 'per year', chargesPerYear: 1 };
-    if (servicesPerYear === 2)                           return { label: 'every 6 months', chargesPerYear: 2 };
+    if (servicesPerYear >= 11 && servicesPerYear <= 13)  return { label: 'per month',      adjective: 'monthly',       chargesPerYear: servicesPerYear };
+    if (servicesPerYear >= 3 && servicesPerYear <= 4)    return { label: 'per quarter',    adjective: 'quarterly',     chargesPerYear: servicesPerYear };
+    if (servicesPerYear === 1)                           return { label: 'per year',       adjective: 'annually',      chargesPerYear: 1 };
+    if (servicesPerYear === 2)                           return { label: 'every 6 months', adjective: 'semi-annually', chargesPerYear: 2 };
   }
 
-  return { label: 'per service', chargesPerYear: null };
+  return { label: 'per service', adjective: 'per service', chargesPerYear: null };
 }
 
 /**
@@ -403,7 +403,9 @@ export function computeEmailVariables({
       variables: {
         ...baseVars,
         increase: formatUSD(increase),
+        new_price: formatUSD(Number(svc.newPrice) || 0),
         time_unit: billing.label,
+        new_billing_frequency: billing.adjective,
       },
     };
   } else {
@@ -448,8 +450,10 @@ export async function sendPriceIncreaseEmail({
   unsubscribeUrl,
   fromEmail,
   fromName,
+  replyTo,
   branding = {},
   templateConfig = null,
+  dryRun = false,
 }) {
   const senderEmail = fromEmail || `${clientName.toLowerCase()}@${NOTIFICATION_FROM_DOMAIN}`;
   const senderName = fromName || clientName;
@@ -480,6 +484,7 @@ export async function sendPriceIncreaseEmail({
     recipient, recipientName: resolvedCustomerName, firstName, accountName,
     clientName, senderEmail, senderName, services: normalizedServices,
     effectiveDate, unsubscribeUrl, branding, templateConfig: templateConfig || {},
+    replyTo, dryRun,
   });
 }
 
@@ -490,6 +495,7 @@ async function sendTemplatedEmail({
   recipient, recipientName, firstName, accountName,
   clientName, senderEmail, senderName, services,
   effectiveDate, unsubscribeUrl, branding, templateConfig,
+  replyTo, dryRun = false,
 }) {
   // Merge incoming config with defaults — configured values win
   const cfg = { ...DEFAULT_TEMPLATE, ...Object.fromEntries(
@@ -610,6 +616,20 @@ ${footer}
 To unsubscribe: ${unsubscribeUrl}
   `.trim();
 
+  // Dry-run: return the rendered payload without sending.
+  if (dryRun) {
+    return {
+      success: true,
+      dryRun: true,
+      rendered: {
+        subject, textContent, htmlContent,
+        senderEmail, senderName, replyTo: replyTo || null,
+        recipient, recipientName: recipientName || null,
+        mode,
+      },
+    };
+  }
+
   // Send via MailerSend (or log)
   if (!MAILERSEND_API_KEY || !mailerSend) {
     console.log('[EmailService] Would send templated price increase email to:', recipient);
@@ -643,6 +663,7 @@ To unsubscribe: ${unsubscribeUrl}
       .setText(textContent)
       .setHtml(htmlContent);
 
+    if (replyTo) emailParams.setReplyTo(new Recipient(replyTo));
     if (ccList.length > 0) emailParams.setCc(ccList);
     if (bccList.length > 0) emailParams.setBcc(bccList);
 
@@ -662,6 +683,8 @@ To unsubscribe: ${unsubscribeUrl}
           .setSubject(subject)
           .setText(textContent)
           .setHtml(htmlContent);
+
+        if (replyTo) retryParams.setReplyTo(new Recipient(replyTo));
 
         const messageId = await sendWithParams(retryParams);
         console.log(`[EmailService] Retry without CC/BCC succeeded for ${recipient}. MessageId: ${messageId}`);

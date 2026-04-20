@@ -456,9 +456,14 @@ export async function fetchNotificationConfig(client) {
 
     let fromEmail = null;
     if (customAddress) {
-        const localPart = customAddress.includes('@') ? customAddress.split('@')[0] : customAddress;
-        fromEmail = `${localPart}@${customDomain || process.env.MAILERSEND_FROM_DOMAIN || 'pestnotifications.com'}`;
+        fromEmail = customAddress.includes('@')
+            ? customAddress
+            : `${customAddress}@${customDomain || process.env.MAILERSEND_FROM_DOMAIN || 'pestnotifications.com'}`;
     }
+
+    // Reply-to: client's own verified address when present; otherwise central fallback.
+    const replyToFallback = process.env.NOTIFICATION_REPLY_TO_FALLBACK || 'nate@pestnotifications.com';
+    const replyTo = customAddress && customAddress.includes('@') ? customAddress : replyToFallback;
 
     // Build templateConfig from all notification_* settings
     const templateConfig = {};
@@ -469,6 +474,7 @@ export async function fetchNotificationConfig(client) {
     return {
         fromEmail,
         fromName: customName || null,
+        replyTo,
         templateConfig, // All notification_* settings as a flat object
     };
 }
@@ -643,6 +649,7 @@ export async function sendNotificationTargets({
             unsubscribeUrl,
             ...(senderConfig.fromEmail ? { fromEmail: senderConfig.fromEmail } : {}),
             ...(senderConfig.fromName ? { fromName: senderConfig.fromName } : {}),
+            ...(senderConfig.replyTo ? { replyTo: senderConfig.replyTo } : {}),
             ...(senderConfig.templateConfig ? { templateConfig: senderConfig.templateConfig } : {}),
         });
 
@@ -794,6 +801,7 @@ export async function runDuePrePushNotifications({
     sentBy = 'cloud_run_job',
     testRecipient = null,
     sendLimit = null,
+    preflight = null, // optional async ({ period, senderConfig, counts, sample, sanity }) => boolean
 } = {}) {
     const normalizedTargetDate = normalizeDateOnly(targetDate) || new Date().toISOString().slice(0, 10);
     const trimmedBaseUrl = typeof baseUrl === 'string' ? baseUrl.trim().replace(/\/+$/, '') : '';
@@ -877,6 +885,76 @@ export async function runDuePrePushNotifications({
         summary.processedPeriodCount++;
 
         const selectedIdSet = new Set(selectedIds.map(String));
+
+        // Preflight validation — render one sample and hand control to caller.
+        if (preflight && selectedIds.length > 0) {
+            const sampleTarget = eligibility.targets.find((t) => selectedIdSet.has(String(t.selectionId)));
+            let sample = null;
+            if (sampleTarget) {
+                const sampleUnsubToken = Buffer
+                    .from(JSON.stringify({ client: duePeriod.client, email: sampleTarget.email, masterAccountId: sampleTarget.masterAccountId }))
+                    .toString('base64');
+                const sampleUnsubUrl = `${trimmedBaseUrl}/api/repricing/price-push/unsubscribe?token=${encodeURIComponent(sampleUnsubToken)}`;
+                const rendered = await sendPriceIncreaseEmail({
+                    recipient: testRecipient || sampleTarget.email,
+                    recipientName: sampleTarget.customerName,
+                    customerName: sampleTarget.customerName,
+                    accountName: sampleTarget.accountName || sampleTarget.masterAccountId,
+                    clientName: duePeriod.client,
+                    effectiveDate: sampleTarget.effectiveDate,
+                    services: sampleTarget.services,
+                    unsubscribeUrl: sampleUnsubUrl,
+                    ...(senderConfig.fromEmail ? { fromEmail: senderConfig.fromEmail } : {}),
+                    ...(senderConfig.fromName ? { fromName: senderConfig.fromName } : {}),
+                    ...(senderConfig.replyTo ? { replyTo: senderConfig.replyTo } : {}),
+                    ...(senderConfig.templateConfig ? { templateConfig: senderConfig.templateConfig } : {}),
+                    dryRun: true,
+                });
+                sample = { target: sampleTarget, rendered: rendered.rendered };
+            }
+
+            // Sanity checks
+            const sanity = { warnings: [] };
+            if (sample) {
+                const blob = `${sample.rendered.subject}\n${sample.rendered.textContent}`;
+                const unresolved = blob.match(/\{[a-z_][a-z0-9_]*\}/gi);
+                if (unresolved && unresolved.length > 0) {
+                    sanity.warnings.push(`Unresolved template placeholders in rendered sample: ${[...new Set(unresolved)].join(', ')}`);
+                }
+                for (const svc of sample.target.services) {
+                    const oldP = Number(svc.oldCharge ?? svc.currentPrice) || 0;
+                    const newP = Number(svc.newCharge ?? svc.newPrice) || 0;
+                    if (oldP > 0 && newP <= oldP) {
+                        sanity.warnings.push(`Service "${svc.serviceTypeName}" has newPrice (${newP}) <= oldPrice (${oldP})`);
+                    }
+                    if (oldP > 0) {
+                        const pct = ((newP - oldP) / oldP) * 100;
+                        if (pct > 20) sanity.warnings.push(`Service "${svc.serviceTypeName}" increase ${pct.toFixed(1)}% exceeds 20%`);
+                    }
+                }
+            }
+            if (!senderConfig.fromEmail) sanity.warnings.push('senderConfig.fromEmail is null — using fallback');
+            if (!senderConfig.replyTo) sanity.warnings.push('senderConfig.replyTo is null');
+
+            const proceed = await preflight({
+                period: periodSummary,
+                senderConfig,
+                counts: {
+                    eligible: eligibility.summary.eligible,
+                    noEmail: eligibility.summary.noEmail,
+                    unsubscribed: eligibility.summary.unsubscribed,
+                    alreadySent: eligibility.summary.alreadySent,
+                    toSend: selectedIds.length,
+                },
+                sample,
+                sanity,
+            });
+            if (!proceed) {
+                periodSummary.status = 'skipped_preflight_declined';
+                summary.periods.push(periodSummary);
+                continue;
+            }
+        }
 
         let result = { details: [] };
         if (selectedIds.length > 0) {
