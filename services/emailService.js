@@ -416,11 +416,9 @@ export function computeEmailVariables({
       const freq = svc.billingFrequency ?? svc.billing_frequency;
       let spy = Number(svc.servicesPerYear ?? svc.services_per_year) || 0;
 
-      // Derive servicesPerYear from billingFrequency if missing
       if (!spy || spy <= 0) {
         const billing = billingFrequencyToLabel(freq);
-        spy = billing.chargesPerYear || 12; // fallback to monthly
-        console.warn(`[EmailService] servicesPerYear missing for service ${svc.serviceTypeName || 'unknown'}, derived ${spy} from billing_frequency ${freq}`);
+        spy = billing.chargesPerYear || 12;
       }
 
       annualIncrease += inc * spy;

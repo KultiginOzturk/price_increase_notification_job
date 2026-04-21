@@ -1,14 +1,14 @@
 $ErrorActionPreference = "Stop"
 
 # Fill these in before running.
-$PROJECT_ID = "pco-prod"
+$PROJECT_ID = "pco-cleanup"
 $REGION = "us-central1"
 $REPOSITORY = "price-increase-notification-job"
 $IMAGE_NAME = "price-increase-notification"
 $JOB_NAME = "price-increase-notification"
 $CLOUDSQL_INSTANCE = "client-ops-warm-layer"
 $APP_URL = "https://clientportal.pestanalytics.com"
-$RUNTIME_SERVICE_ACCOUNT = "github-deploy@pco-prod.iam.gserviceaccount.com"
+$RUNTIME_SERVICE_ACCOUNT = "price-push-api-sa@pco-cleanup.iam.gserviceaccount.com"
 
 $IMAGE_URI = "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:latest"
 $CLOUDSQL_CONNECTION = "${PROJECT_ID}:${REGION}:${CLOUDSQL_INSTANCE}"
