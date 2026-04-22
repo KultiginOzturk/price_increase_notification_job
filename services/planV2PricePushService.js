@@ -1,5 +1,5 @@
 import { query as pgQuery } from '../lib/postgres.js';
-import { getRCP, SHARED } from '../config/tables.js';
+import { getRCP, SHARED, PLAN_TABLES } from '../config/tables.js';
 import { runQuery } from '../utils/bigquery.js';
 import { getMonthAbbreviation } from '../utils/repricingScheduling.js';
 import { calculatePushArv, calculatePushServiceCharge } from '../utils/pricePushMath.js';
@@ -39,7 +39,7 @@ export function getEffectivePeriodMeta(effectivePeriod) {
 export async function getPublishedPlanV2(client) {
     const result = await pgQuery(`
         SELECT id, company_key, status, philosophy, published_at, last_generated_at, speed_limit_global_pct
-        FROM planv2_plan
+        FROM ${PLAN_TABLES.plan}
         WHERE company_key = $1
           AND status = 'published'
         ORDER BY published_at DESC NULLS LAST, id DESC
@@ -61,11 +61,11 @@ export async function getPlanV2PushPeriods(planId, client) {
                         ELSE COALESCE(ad.computed_increase_dollar, 0)
                     END
                 ), 0) AS total_revenue_impact
-            FROM planv2_account_decision ad
-            INNER JOIN planv2_plan p
+            FROM ${PLAN_TABLES.accountDecision} ad
+            INNER JOIN ${PLAN_TABLES.plan} p
                 ON p.id = ad.plan_id
                AND p.company_key = $2
-            LEFT JOIN planv2_client_response account_skip
+            LEFT JOIN ${PLAN_TABLES.clientResponse} account_skip
                 ON account_skip.plan_id = ad.plan_id
                AND account_skip.client = $2
                AND account_skip.master_account_id = ad.master_account_id
@@ -164,11 +164,11 @@ export async function buildPlanV2PricePushSource({ client, effectivePeriod }) {
             COALESCE(ad.total_recurring_revenue, 0) AS total_recurring_revenue,
             COALESCE(ad.subscription_count, 0) AS subscription_count,
             COALESCE(ad.ntm_gross_margin_pct, 0) AS current_margin_pct
-        FROM planv2_account_decision ad
-        INNER JOIN planv2_plan p
+        FROM ${PLAN_TABLES.accountDecision} ad
+        INNER JOIN ${PLAN_TABLES.plan} p
             ON p.id = ad.plan_id
            AND p.company_key = $2
-        LEFT JOIN planv2_client_response account_skip
+        LEFT JOIN ${PLAN_TABLES.clientResponse} account_skip
             ON account_skip.plan_id = ad.plan_id
            AND account_skip.client = $2
            AND account_skip.master_account_id = ad.master_account_id
@@ -213,20 +213,20 @@ export async function buildPlanV2PricePushSource({ client, effectivePeriod }) {
             COALESCE(sd.new_price, 0) AS new_price,
             COALESCE(sd.increase_pct, 0) AS increase_pct,
             COALESCE(sd.increase_dollar_annual, 0) AS increase_dollar_annual
-        FROM planv2_subscription_decision sd
-        INNER JOIN planv2_account_decision ad
+        FROM ${PLAN_TABLES.subscriptionDecision} sd
+        INNER JOIN ${PLAN_TABLES.accountDecision} ad
             ON ad.id = sd.account_decision_id
            AND ad.plan_id = sd.plan_id
-        INNER JOIN planv2_plan p
+        INNER JOIN ${PLAN_TABLES.plan} p
             ON p.id = ad.plan_id
            AND p.company_key = $2
-        LEFT JOIN planv2_client_response account_skip
+        LEFT JOIN ${PLAN_TABLES.clientResponse} account_skip
             ON account_skip.plan_id = sd.plan_id
            AND account_skip.client = $2
            AND account_skip.master_account_id = sd.master_account_id
            AND account_skip.subscription_id IS NULL
            AND account_skip.action = 'skip'
-        LEFT JOIN planv2_client_response subscription_skip
+        LEFT JOIN ${PLAN_TABLES.clientResponse} subscription_skip
             ON subscription_skip.plan_id = sd.plan_id
            AND subscription_skip.client = $2
            AND subscription_skip.master_account_id = sd.master_account_id

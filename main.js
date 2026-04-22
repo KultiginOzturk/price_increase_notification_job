@@ -58,6 +58,7 @@ function logPeriodSummary(period) {
         `noEmail=${period.noEmail ?? 0}`,
         `unsubscribed=${period.unsubscribed ?? 0}`,
         `alreadySent=${period.alreadySent ?? 0}`,
+        `excludedTag=${period.excludedTag ?? 0}`,
         `sent=${period.sent ?? 0}`,
         `failed=${period.failed ?? 0}`,
     ];
@@ -79,31 +80,94 @@ function formatPreflightSection(title, body) {
     return `\n${bar}\n${title}\n${bar}\n${body}\n`;
 }
 
-async function interactivePreflight({ period, senderConfig, counts, sample, sanity }) {
+async function interactivePreflight({ period, senderConfig, counts, excluded, sample, sanity }) {
     const periodHeader = `Client: ${period.client}  |  Effective period: ${period.effectivePeriod}  |  Effective date: ${period.effectiveDate || 'n/a'}`;
     console.log(`\n\n════════════════════════════════════════════════════════════`);
     console.log(`PREFLIGHT — ${periodHeader}`);
     console.log(`════════════════════════════════════════════════════════════`);
 
-    // (1) Sender identity
-    console.log(formatPreflightSection('1/4  SENDER IDENTITY', [
+    const hasExcludedSection = excluded && excluded.keys?.length > 0;
+    const total = hasExcludedSection ? 5 : 4;
+    let step = 1;
+    const label = (title) => `${step++}/${total}  ${title}`;
+
+    // Sender identity
+    console.log(formatPreflightSection(label('SENDER IDENTITY'), [
         `From email:  ${senderConfig.fromEmail || '(fallback to env default)'}`,
         `From name:   ${senderConfig.fromName || '(fallback to client name)'}`,
         `Reply-to:    ${senderConfig.replyTo || '(none)'}`,
     ].join('\n')));
     if (!(await promptYesNo('Sender identity looks correct — proceed?'))) return false;
 
-    // (2) Counts
-    console.log(formatPreflightSection('2/4  RECIPIENT COUNTS', [
+    // Counts
+    console.log(formatPreflightSection(label('RECIPIENT COUNTS'), [
         `Will send to:      ${counts.toSend}`,
         `Eligible total:    ${counts.eligible}`,
         `No email on file:  ${counts.noEmail}`,
         `Unsubscribed:      ${counts.unsubscribed}`,
         `Already sent:      ${counts.alreadySent}`,
+        `Excluded by tag:   ${counts.excludedTag ?? 0}`,
     ].join('\n')));
     if (!(await promptYesNo('Counts look correct — proceed?'))) return false;
 
-    // (3) Sample rendered email
+    // Excluded-tag validation (whenever tags are configured, even if 0 match this cohort)
+    if (hasExcludedSection) {
+        const breakdown = excluded.breakdown || {};
+        const currentPeriod = excluded.currentPeriod || '(this cohort)';
+        const isPeriod = (loc) => /^\d{4}-\d{2}$/.test(loc);
+        const formatLocation = (loc, n) => (isPeriod(loc) ? `${n} in ${loc}` : `${n} ${String(loc).replace(/_/g, ' ')}`);
+
+        const tagLines = [];
+        for (const tag of excluded.keys) {
+            const inCohort = excluded.countsByTag[tag] ?? 0;
+            const tagBreakdown = breakdown[tag] || { total: 0, byLocation: {} };
+            const total = tagBreakdown.total;
+            const elsewhere = Object.entries(tagBreakdown.byLocation)
+                .filter(([loc]) => loc !== currentPeriod)
+                .sort(([a], [b]) => {
+                    const ap = isPeriod(a); const bp = isPeriod(b);
+                    if (ap && bp) return a.localeCompare(b);
+                    if (ap) return -1;
+                    if (bp) return 1;
+                    return a.localeCompare(b);
+                });
+
+            const head = `  ${tag.padEnd(30)} ${String(inCohort).padStart(4)} in ${currentPeriod} / ${String(total).padStart(4)} total`;
+
+            if (total === 0) {
+                tagLines.push(head + '  ← no accounts carry this tag yet');
+                continue;
+            }
+            if (elsewhere.length === 0) {
+                tagLines.push(head); // all tagged accounts are in this cohort — nothing more to say
+                continue;
+            }
+            tagLines.push(head);
+            const prefix = inCohort === 0 ? 'none in this cohort; elsewhere' : 'elsewhere';
+            const text = elsewhere.map(([loc, n]) => formatLocation(loc, n)).join(', ');
+            tagLines.push(`     ← ${prefix}: ${text}`);
+        }
+
+        const sampleLines = excluded.samples.length === 0
+            ? '  (none in this cohort)'
+            : excluded.samples
+                .map((s) => `  ${String(s.accountId).padEnd(14)} ${(s.accountName || '').slice(0, 40).padEnd(42)} [${s.matchedTags.join(', ')}]`)
+                .join('\n');
+        const body = [
+            `Configured tag keys:    ${excluded.keys.join(', ')}`,
+            `Total excluded from this send:  ${counts.excludedTag}`,
+            '',
+            `By tag (in this cohort / total tagged for this client on the current plan):`,
+            tagLines.join('\n'),
+            '',
+            `Sample excluded accounts (first ${excluded.samples.length} of ${counts.excludedTag}):`,
+            sampleLines,
+        ].join('\n');
+        console.log(formatPreflightSection(label('EXCLUDED-TAG VALIDATION'), body));
+        if (!(await promptYesNo('Excluded accounts look correct — proceed?'))) return false;
+    }
+
+    // Sample rendered email
     const r = sample?.rendered;
     const sampleBody = r
         ? [
@@ -117,14 +181,14 @@ async function interactivePreflight({ period, senderConfig, counts, sample, sani
               '--- END BODY ---',
           ].join('\n')
         : '(no sample rendered — nothing to show)';
-    console.log(formatPreflightSection(`3/4  SAMPLE EMAIL (acct ${sample?.target?.masterAccountId ?? 'n/a'})`, sampleBody));
+    console.log(formatPreflightSection(label(`SAMPLE EMAIL (acct ${sample?.target?.masterAccountId ?? 'n/a'})`), sampleBody));
     if (!(await promptYesNo('Sample email looks correct — proceed?'))) return false;
 
-    // (4) Sanity checks
+    // Sanity checks
     const sanityBody = sanity.warnings.length === 0
         ? 'All automated checks passed.'
         : ['Warnings:', ...sanity.warnings.map((w) => `  - ${w}`)].join('\n');
-    console.log(formatPreflightSection('4/4  AUTOMATED SANITY CHECKS', sanityBody));
+    console.log(formatPreflightSection(label('AUTOMATED SANITY CHECKS'), sanityBody));
     if (!(await promptYesNo('Sanity checks acceptable — proceed with send?'))) return false;
 
     return true;

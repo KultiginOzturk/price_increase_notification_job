@@ -256,4 +256,32 @@ export const SHARED = {
 // Export project for direct access if needed
 export const PROJECT = BQ_PROJECT;
 
+/**
+ * Cloud SQL plan-workflow table names.
+ *
+ * pco-prod (and every other env we currently deploy to) uses the legacy
+ * `planv2_*` names. pco-cleanup was renamed to drop the v2 prefix and also
+ * renamed `planv2_plan` → `plan_run`. Until the rename propagates everywhere,
+ * the table names are selected via the PLAN_SCHEMA env var:
+ *   PLAN_SCHEMA=legacy  (default)  → planv2_plan, planv2_account_decision, ...
+ *   PLAN_SCHEMA=renamed            → plan_run, plan_account_decision, ...
+ */
+export const PLAN_TABLES = (() => {
+    const variant = String(process.env.PLAN_SCHEMA || 'legacy').toLowerCase();
+    if (variant === 'renamed') {
+        return {
+            plan: 'plan_run',
+            accountDecision: 'plan_account_decision',
+            clientResponse: 'plan_client_response',
+            subscriptionDecision: 'plan_subscription_decision',
+        };
+    }
+    return {
+        plan: 'planv2_plan',
+        accountDecision: 'planv2_account_decision',
+        clientResponse: 'planv2_client_response',
+        subscriptionDecision: 'planv2_subscription_decision',
+    };
+})();
+
 export default { getRCP, RCP, CONFIG, INPUTS, getSERVICES, SERVICES, SHARED, PROJECT };

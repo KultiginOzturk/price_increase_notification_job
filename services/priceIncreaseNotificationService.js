@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { query as pgQuery } from '../lib/postgres.js';
-import { getRCP, INPUTS, SHARED } from '../config/tables.js';
+import { getRCP, INPUTS, SHARED, PLAN_TABLES } from '../config/tables.js';
 import { runQuery } from '../utils/bigquery.js';
 import { deriveTimingFromPeriod } from '../routes/planV2/timing.js';
 import { sendPriceIncreaseEmail, validateEmails } from './emailService.js';
@@ -66,6 +66,12 @@ const buildServiceRow = (service) => {
         billingFrequency: service.billingFrequency ?? service.billing_frequency ?? null,
         servicesPerYear: service.servicesPerYear ?? service.services_per_year ?? null,
         recurringPriceCharge: service.recurringPriceCharge ?? service.recurring_price_charge ?? null,
+        // Authoritative annual totals (pre-push: oldArv/newArv/annualIncrease from planV2PricePushService).
+        // emailService prefers these over reconstructing via per-cycle × spy, which breaks when
+        // service cadence differs from billing cadence.
+        annualCurrent: Number(service.annualCurrent ?? service.annual_current ?? service.oldArv ?? service.old_arv) || 0,
+        annualNew: Number(service.annualNew ?? service.annual_new ?? service.newArv ?? service.new_arv) || 0,
+        annualIncrease: Number(service.annualIncrease ?? service.annual_increase) || 0,
     };
 };
 
@@ -86,6 +92,7 @@ export const buildNotificationSummary = (targets) => {
         noEmail: 0,
         unsubscribed: 0,
         alreadySent: 0,
+        excludedTag: 0,
     };
 
     for (const target of targets) {
@@ -101,6 +108,9 @@ export const buildNotificationSummary = (targets) => {
                 break;
             case 'already_sent':
                 summary.alreadySent++;
+                break;
+            case 'excluded_tag':
+                summary.excludedTag++;
                 break;
             default:
                 break;
@@ -134,17 +144,34 @@ const fetchCustomerContacts = async (client, customerIds) => {
         return new Map();
     }
 
+    // Prefer billing_first_name when present: cur_customer lacks it, norm_customer_fieldroutes
+    // lacks it, it only lives on raw_layer.FR_CUSTOMER. Raw uses the parent client key
+    // ('CDPC' covers all CDPC_* offices) + OFFICE_ID, so we hop through norm to pick up the
+    // office_id for this (client, customer_id) tuple.
     const rows = await runQuery(`
         SELECT
-            CAST(customer_id AS STRING) AS customer_id,
-            email,
-            billing_email,
-            first_name,
-            last_name,
-            company_name
-        FROM ${SHARED.curCustomer}
-        WHERE client = @client
-          AND CAST(customer_id AS STRING) IN UNNEST(@customerIds)
+            CAST(c.customer_id AS STRING) AS customer_id,
+            c.email,
+            c.billing_email,
+            COALESCE(NULLIF(TRIM(f.billing_first_name), ''), c.first_name) AS first_name,
+            c.last_name,
+            c.company_name
+        FROM ${SHARED.curCustomer} c
+        LEFT JOIN ${SHARED.normCustomerFieldroutes} n
+            ON CAST(n.customer_id AS STRING) = CAST(c.customer_id AS STRING)
+           AND n.client = c.client
+        LEFT JOIN (
+            SELECT
+                CAST(CUSTOMER_ID AS STRING) AS customer_id,
+                CAST(OFFICE_ID AS STRING) AS office_id,
+                MAX(NULLIF(TRIM(BILLING_FIRST_NAME), '')) AS billing_first_name
+            FROM ${SHARED.rawCustomer}
+            GROUP BY customer_id, office_id
+        ) f
+            ON f.customer_id = CAST(c.customer_id AS STRING)
+           AND f.office_id = CAST(n.office_id AS STRING)
+        WHERE c.client = @client
+          AND CAST(c.customer_id AS STRING) IN UNNEST(@customerIds)
     `, { client, customerIds: dedupedCustomerIds }, 'price-increase-notify-customer-contacts');
 
     return new Map(rows.map((row) => [String(row.customer_id), {
@@ -218,7 +245,7 @@ export async function fetchPostPushNotificationTargets({ client, queueIds = null
             SELECT
                 qa.queue_id,
                 c.email,
-                c.first_name,
+                COALESCE(NULLIF(TRIM(f.billing_first_name), ''), c.first_name) AS first_name,
                 c.last_name,
                 c.company_name,
                 c.customer_id,
@@ -239,6 +266,19 @@ export async function fetchPostPushNotificationTargets({ client, queueIds = null
                 ON TRUE
             LEFT JOIN ${SHARED.curCustomer} c
                 ON customer_id = c.customer_id AND @client = c.client
+            LEFT JOIN ${SHARED.normCustomerFieldroutes} n
+                ON CAST(n.customer_id AS STRING) = CAST(c.customer_id AS STRING)
+               AND n.client = c.client
+            LEFT JOIN (
+                SELECT
+                    CAST(CUSTOMER_ID AS STRING) AS customer_id,
+                    CAST(OFFICE_ID AS STRING) AS office_id,
+                    MAX(NULLIF(TRIM(BILLING_FIRST_NAME), '')) AS billing_first_name
+                FROM ${SHARED.rawCustomer}
+                GROUP BY customer_id, office_id
+            ) f
+                ON f.customer_id = CAST(c.customer_id AS STRING)
+               AND f.office_id = CAST(n.office_id AS STRING)
         )
         SELECT
             qa.queue_id,
@@ -322,6 +362,72 @@ export async function fetchPostPushNotificationTargets({ client, queueIds = null
         };
     });
 }
+
+const fetchExcludedAccountTags = async (client, masterAccountIds, excludedTagKeys) => {
+    if (!excludedTagKeys || excludedTagKeys.length === 0) {
+        return new Map();
+    }
+    const dedupedIds = [...new Set((masterAccountIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+    if (dedupedIds.length === 0) {
+        return new Map();
+    }
+
+    const result = await pgQuery(`
+        SELECT master_account_id, tag_type_key
+        FROM inp_account_tags
+        WHERE client = $1
+          AND master_account_id = ANY($2::text[])
+          AND tag_type_key = ANY($3::text[])
+          AND is_current = TRUE
+          AND (expires_at IS NULL OR expires_at > NOW())
+    `, [client, dedupedIds, excludedTagKeys]);
+
+    const byAccount = new Map();
+    for (const row of result.rows) {
+        const id = String(row.master_account_id);
+        if (!byAccount.has(id)) byAccount.set(id, []);
+        byAccount.get(id).push(row.tag_type_key);
+    }
+    return byAccount;
+};
+
+const fetchExcludedTagBreakdown = async (client, planId, excludedTagKeys) => {
+    if (!excludedTagKeys || excludedTagKeys.length === 0 || !planId) {
+        return Object.fromEntries((excludedTagKeys || []).map((k) => [k, { total: 0, byLocation: {} }]));
+    }
+
+    const result = await pgQuery(`
+        SELECT
+            t.tag_type_key,
+            CASE
+                WHEN pad.plan_id IS NULL THEN 'not_in_plan'
+                WHEN pad.is_ghost THEN 'ghost'
+                WHEN pad.effective_period IS NOT NULL THEN pad.effective_period
+                WHEN pad.review_tab = 'always_manual' THEN 'always_manual'
+                ELSE 'unscheduled'
+            END AS location,
+            COUNT(DISTINCT t.master_account_id)::int AS n
+        FROM inp_account_tags t
+        LEFT JOIN ${PLAN_TABLES.accountDecision} pad
+            ON pad.master_account_id = t.master_account_id
+           AND pad.plan_id = $1
+        WHERE t.client = $2
+          AND t.tag_type_key = ANY($3::text[])
+          AND t.is_current = TRUE
+          AND (t.expires_at IS NULL OR t.expires_at > NOW())
+        GROUP BY t.tag_type_key, location
+    `, [planId, client, excludedTagKeys]);
+
+    const breakdown = Object.fromEntries(excludedTagKeys.map((k) => [k, { total: 0, byLocation: {} }]));
+    for (const row of result.rows) {
+        if (!breakdown[row.tag_type_key]) {
+            breakdown[row.tag_type_key] = { total: 0, byLocation: {} };
+        }
+        breakdown[row.tag_type_key].byLocation[row.location] = row.n;
+        breakdown[row.tag_type_key].total += row.n;
+    }
+    return breakdown;
+};
 
 const fetchUnsubscribedEmails = async (client, emails) => {
     const normalizedEmails = [...new Set((emails || []).map(normalizeEmail).filter(Boolean))];
@@ -410,14 +516,20 @@ const fetchAlreadySentKeys = async (client, mode, targets) => {
     return keys;
 };
 
-export async function annotateNotificationEligibility({ client, mode, targets }) {
-    const unsubscribedEmails = await fetchUnsubscribedEmails(client, targets.map((target) => target.email));
-    const alreadySentKeys = await fetchAlreadySentKeys(client, mode, targets);
+export async function annotateNotificationEligibility({ client, mode, targets, excludedTagKeys = [] }) {
+    const [unsubscribedEmails, alreadySentKeys, excludedTagsByAccount] = await Promise.all([
+        fetchUnsubscribedEmails(client, targets.map((target) => target.email)),
+        fetchAlreadySentKeys(client, mode, targets),
+        fetchExcludedAccountTags(client, targets.map((target) => target.masterAccountId), excludedTagKeys),
+    ]);
 
     const withEligibility = targets.map((target) => {
         const email = normalizeEmail(target.email);
+        const matchedTags = excludedTagsByAccount.get(String(target.masterAccountId)) || [];
         let eligibility = 'eligible';
-        if (!email || !isValidEmail(email)) {
+        if (matchedTags.length > 0) {
+            eligibility = 'excluded_tag';
+        } else if (!email || !isValidEmail(email)) {
             eligibility = 'no_email';
         } else if (unsubscribedEmails.has(email)) {
             eligibility = 'unsubscribed';
@@ -431,6 +543,7 @@ export async function annotateNotificationEligibility({ client, mode, targets })
             dedupKey: buildDedupKey(target),
             email,
             eligibility,
+            excludedByTags: matchedTags,
         };
     });
 
@@ -471,11 +584,17 @@ export async function fetchNotificationConfig(client) {
         if (value != null) templateConfig[key] = value;
     }
 
+    const excludedTagsRaw = settings.get('notification_excluded_tags')?.trim();
+    const excludedTagKeys = excludedTagsRaw
+        ? [...new Set(excludedTagsRaw.split(',').map((value) => value.trim()).filter(Boolean))]
+        : [];
+
     return {
         fromEmail,
         fromName: customName || null,
         replyTo,
         templateConfig, // All notification_* settings as a flat object
+        excludedTagKeys,
     };
 }
 
@@ -517,6 +636,7 @@ export async function sendNotificationTargets({
         skippedNoEmail: 0,
         skippedUnsubscribed: 0,
         skippedAlreadySent: 0,
+        skippedExcludedTag: 0,
         total: selectedTargets.length,
         details: [],
     };
@@ -548,6 +668,30 @@ export async function sendNotificationTargets({
                 recipient_email: target.email,
                 recipient_name: target.customerName,
                 status: 'skipped_no_email',
+                error_message: null,
+                mailersend_message_id: null,
+                service_count: target.services.length,
+                sent_by: sentBy,
+            });
+            continue;
+        }
+
+        if (target.eligibility === 'excluded_tag') {
+            results.skippedExcludedTag++;
+            results.details.push({ ...detail, status: 'skipped_excluded_tag', email: target.email || undefined });
+            eventRows.push({
+                id: randomUUID(),
+                client,
+                mode,
+                plan_id: target.planId,
+                effective_period: target.effectivePeriod,
+                effective_date: target.effectiveDate,
+                queue_id: target.queueId,
+                master_account_id: target.masterAccountId,
+                account_name: target.accountName,
+                recipient_email: target.email,
+                recipient_name: target.customerName,
+                status: 'skipped_excluded_tag',
                 error_message: null,
                 mailersend_message_id: null,
                 service_count: target.services.length,
@@ -743,7 +887,7 @@ export async function findDuePrePushNotificationPeriods({ targetDate = null, cli
                 id,
                 company_key,
                 published_at
-            FROM planv2_plan
+            FROM ${PLAN_TABLES.plan}
             WHERE status = 'published'
             ${clientFilterSql}
             ORDER BY company_key, published_at DESC NULLS LAST, id DESC
@@ -755,9 +899,9 @@ export async function findDuePrePushNotificationPeriods({ targetDate = null, cli
                 ad.effective_period,
                 COUNT(*)::int AS account_count
             FROM latest_published lp
-            INNER JOIN planv2_account_decision ad
+            INNER JOIN ${PLAN_TABLES.accountDecision} ad
                 ON ad.plan_id = lp.id
-            LEFT JOIN planv2_client_response account_skip
+            LEFT JOIN ${PLAN_TABLES.clientResponse} account_skip
                 ON account_skip.plan_id = ad.plan_id
                AND account_skip.client = lp.company_key
                AND account_skip.master_account_id = ad.master_account_id
@@ -824,6 +968,7 @@ export async function runDuePrePushNotifications({
         noEmail: 0,
         unsubscribed: 0,
         alreadySent: 0,
+        excludedTag: 0,
         periods: [],
         records: [],
     };
@@ -845,12 +990,13 @@ export async function runDuePrePushNotifications({
         }
 
         const targets = await buildPrePushNotificationTargets({ client: duePeriod.client, batch });
+        const senderConfig = await fetchNotificationConfig(duePeriod.client);
         const eligibility = await annotateNotificationEligibility({
             client: duePeriod.client,
             mode: PRE_PUSH_MODE,
             targets,
+            excludedTagKeys: senderConfig.excludedTagKeys,
         });
-        const senderConfig = await fetchNotificationConfig(duePeriod.client);
         let selectedIds = eligibility.targets
             .filter((target) => target.eligibility === 'eligible')
             .map((target) => target.selectionId);
@@ -873,6 +1019,7 @@ export async function runDuePrePushNotifications({
             noEmail: eligibility.summary.noEmail,
             unsubscribed: eligibility.summary.unsubscribed,
             alreadySent: eligibility.summary.alreadySent,
+            excludedTag: eligibility.summary.excludedTag,
             sent: 0,
             failed: 0,
             status: selectedIds.length > 0 ? 'ready' : 'skipped_no_eligible_targets',
@@ -882,6 +1029,7 @@ export async function runDuePrePushNotifications({
         summary.noEmail += eligibility.summary.noEmail;
         summary.unsubscribed += eligibility.summary.unsubscribed;
         summary.alreadySent += eligibility.summary.alreadySent;
+        summary.excludedTag += eligibility.summary.excludedTag;
         summary.processedPeriodCount++;
 
         const selectedIdSet = new Set(selectedIds.map(String));
@@ -936,6 +1084,25 @@ export async function runDuePrePushNotifications({
             if (!senderConfig.fromEmail) sanity.warnings.push('senderConfig.fromEmail is null — using fallback');
             if (!senderConfig.replyTo) sanity.warnings.push('senderConfig.replyTo is null');
 
+            const excludedTargets = eligibility.targets.filter((t) => t.eligibility === 'excluded_tag');
+            const countsByTag = Object.fromEntries(senderConfig.excludedTagKeys.map((k) => [k, 0]));
+            for (const t of excludedTargets) {
+                for (const tag of (t.excludedByTags || [])) {
+                    countsByTag[tag] = (countsByTag[tag] || 0) + 1;
+                }
+            }
+            const breakdown = await fetchExcludedTagBreakdown(
+                duePeriod.client,
+                batch.plan?.id,
+                senderConfig.excludedTagKeys,
+            );
+            const excludedSamples = excludedTargets.slice(0, 10).map((t) => ({
+                accountId: t.masterAccountId,
+                accountName: t.accountName,
+                email: t.email || null,
+                matchedTags: t.excludedByTags || [],
+            }));
+
             const proceed = await preflight({
                 period: periodSummary,
                 senderConfig,
@@ -944,7 +1111,15 @@ export async function runDuePrePushNotifications({
                     noEmail: eligibility.summary.noEmail,
                     unsubscribed: eligibility.summary.unsubscribed,
                     alreadySent: eligibility.summary.alreadySent,
+                    excludedTag: eligibility.summary.excludedTag,
                     toSend: selectedIds.length,
+                },
+                excluded: {
+                    keys: senderConfig.excludedTagKeys,
+                    countsByTag,
+                    breakdown,
+                    currentPeriod: duePeriod.effectivePeriod,
+                    samples: excludedSamples,
                 },
                 sample,
                 sanity,
@@ -991,6 +1166,9 @@ export async function runDuePrePushNotifications({
                 if (detail?.error) sendStatus = `${sendStatus}: ${detail.error}`;
             } else if (target.eligibility !== 'eligible') {
                 sendStatus = `skipped_${target.eligibility}`;
+                if (target.eligibility === 'excluded_tag' && target.excludedByTags?.length) {
+                    sendStatus += ` (${target.excludedByTags.join(', ')})`;
+                }
             } else {
                 sendStatus = 'skipped_send_limit';
             }

@@ -343,14 +343,6 @@ export function computeEmailVariables({
     if (Number.isNaN(parsed.getTime())) return value;
     return parsed.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
   };
-
-  // Filter out zero-increase subscriptions for mode determination
-  const nonZeroServices = (services || []).filter(s => {
-    const inc = Number(s.increaseAmount) || 0;
-    return inc > 0;
-  });
-
-  // Derive effective_month (e.g., "April 2026") from effectiveDate
   const formatMonth = (value) => {
     if (!value) return '';
     const parsed = new Date(`${value}T00:00:00`);
@@ -358,22 +350,67 @@ export function computeEmailVariables({
     return parsed.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   };
 
-  // Build a plain-text service list (one line per service with new price)
-  const buildServiceList = (svcs) => {
-    if (!svcs || svcs.length === 0) return '';
-    return svcs
-      .filter(s => (Number(s.increaseAmount) || 0) > 0)
-      .map(s => {
-        const billing = billingFrequencyToLabel(
-          s.billingFrequency ?? s.billing_frequency,
-          s.servicesPerYear ?? s.services_per_year
-        );
-        return `${s.serviceTypeName}: ${formatUSD(Number(s.newPrice) || 0)} ${billing.label}`;
-      })
-      .join('\n');
-  };
+  // Filter out zero-increase subscriptions for mode determination
+  const nonZeroServices = (services || []).filter(s => {
+    const inc = Number(s.increaseAmount) || 0;
+    return inc > 0;
+  });
 
-  // Base variables available in all templates
+  // Build service_list: one line per subscription showing service type and NEW price
+  const serviceList = nonZeroServices
+    .map(svc => `${svc.serviceTypeName || 'Service'} — ${formatUSD(Number(svc.newPrice) || 0)}`)
+    .join('\n');
+
+  // Compute per-cadence aggregates across all non-zero subs — drives
+  // {monthly_increase}, {quarterly_increase}, and the four current/new totals.
+  //
+  // PREFERRED: use authoritative annualCurrent / annualNew / annualIncrease when
+  // passed down from the pipeline (planV2PricePushService sets these from
+  // sm.annual_revenue + increase_dollar_annual). Exact and avoids the cadence
+  // mismatch where a quarterly service billed monthly has per_visit × charges_per_year
+  // ≠ true annual.
+  //
+  // FALLBACK: reconstruct from per-cycle × servicesPerYear. Inherits the cadence
+  // caveat but matches prior behavior for callers that don't supply annuals.
+  let totalAnnualIncrease = 0;
+  let totalAnnualCurrent = 0;
+  let totalAnnualNew = 0;
+  for (const svc of nonZeroServices) {
+    const annualCurrent = Number(svc.annualCurrent ?? svc.annual_current) || 0;
+    const annualNew = Number(svc.annualNew ?? svc.annual_new) || 0;
+    const annualIncrease = Number(svc.annualIncrease ?? svc.annual_increase) || 0;
+
+    if (annualCurrent > 0 && annualNew > 0) {
+      totalAnnualCurrent += annualCurrent;
+      totalAnnualNew += annualNew;
+      totalAnnualIncrease += (annualIncrease > 0 ? annualIncrease : (annualNew - annualCurrent));
+      continue;
+    }
+
+    const inc = Number(svc.increaseAmount) || 0;
+    const current = Number(svc.currentPrice ?? svc.current_price) || 0;
+    const next = Number(svc.newPrice ?? svc.new_price) || 0;
+    let spy = Number(svc.servicesPerYear ?? svc.services_per_year) || 0;
+    if (!spy || spy <= 0) {
+      const billing = billingFrequencyToLabel(svc.billingFrequency ?? svc.billing_frequency);
+      spy = billing.chargesPerYear || 12;
+    }
+    totalAnnualIncrease += inc * spy;
+    totalAnnualCurrent += current * spy;
+    totalAnnualNew += next * spy;
+  }
+
+  const totalMonthlyIncrease = totalAnnualIncrease / 12;
+  const totalQuarterlyIncrease = totalAnnualIncrease / 4;
+  const currentMonthlyTotal = totalAnnualCurrent / 12;
+  const currentQuarterlyTotal = totalAnnualCurrent / 4;
+  const newMonthlyTotal = totalAnnualNew / 12;
+  const newQuarterlyTotal = totalAnnualNew / 4;
+  const serviceCount = nonZeroServices.length;
+  const avgMonthlyIncrease = serviceCount > 0 ? totalMonthlyIncrease / serviceCount : 0;
+  const avgQuarterlyIncrease = serviceCount > 0 ? totalQuarterlyIncrease / serviceCount : 0;
+
+  // Base variables available in ALL templates (single + multi)
   const baseVars = {
     first_name: firstName || (customerName ? customerName.split(' ')[0] : ''),
     customer_name: customerName || '',
@@ -381,8 +418,21 @@ export function computeEmailVariables({
     company_name: companyName || templateConfig.notification_from_name || '',
     effective_date: formatDate(effectiveDate),
     effective_month: formatMonth(effectiveDate),
-    service_list: buildServiceList(nonZeroServices),
-    address_list: '', // Future: populated when address pipeline is complete
+    service_list: serviceList,
+    address_list: '',
+    // Per-cadence aggregates — available in both modes
+    monthly_increase: formatUSD(totalMonthlyIncrease),
+    quarterly_increase: formatUSD(totalQuarterlyIncrease),
+    current_monthly_total: formatUSD(currentMonthlyTotal),
+    current_quarterly_total: formatUSD(currentQuarterlyTotal),
+    new_monthly_total: formatUSD(newMonthlyTotal),
+    new_quarterly_total: formatUSD(newQuarterlyTotal),
+    // Service counts — service_count and subscription_count are aliases
+    service_count: String(serviceCount),
+    subscription_count: String(serviceCount),
+    // Per-service averages
+    average_monthly_increase: formatUSD(avgMonthlyIncrease),
+    average_quarterly_increase: formatUSD(avgQuarterlyIncrease),
     // Client business contact variables (from settings)
     client_email: templateConfig.notification_client_email || '',
     client_phone: templateConfig.notification_client_phone || '',
@@ -390,7 +440,6 @@ export function computeEmailVariables({
   };
 
   if (nonZeroServices.length === 1) {
-    // Single subscription mode
     const svc = nonZeroServices[0];
     const billing = billingFrequencyToLabel(
       svc.billingFrequency ?? svc.billing_frequency,
@@ -408,32 +457,9 @@ export function computeEmailVariables({
         new_billing_frequency: billing.adjective,
       },
     };
-  } else {
-    // Multi subscription mode (2+ non-zero subs, or 0 subs edge case)
-    let annualIncrease = 0;
-    for (const svc of nonZeroServices) {
-      const inc = Number(svc.increaseAmount) || 0;
-      const freq = svc.billingFrequency ?? svc.billing_frequency;
-      let spy = Number(svc.servicesPerYear ?? svc.services_per_year) || 0;
-
-      if (!spy || spy <= 0) {
-        const billing = billingFrequencyToLabel(freq);
-        spy = billing.chargesPerYear || 12;
-      }
-
-      annualIncrease += inc * spy;
-    }
-    const monthlyIncrease = annualIncrease / 12;
-
-    return {
-      mode: 'multi',
-      variables: {
-        ...baseVars,
-        monthly_increase: formatUSD(monthlyIncrease),
-        subscription_count: String(nonZeroServices.length),
-      },
-    };
   }
+
+  return { mode: 'multi', variables: { ...baseVars } };
 }
 
 export async function sendPriceIncreaseEmail({
@@ -560,9 +586,6 @@ async function sendTemplatedEmail({
                       </td>
                     </tr>
                   </table>`}
-                  <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.12);">
-                    <span style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.5px; color: ${accentColor};">Your Service Summary</span>
-                  </div>
                 </td>
               </tr>
 
@@ -582,11 +605,8 @@ async function sendTemplatedEmail({
               <!-- FOOTER -->
               <tr>
                 <td style="background: #f8fafc; padding: 24px 32px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px;">
-                  <p style="margin: 0 0 6px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; color: #94a3b8; text-align: center;">
-                    ${footerHtml}
-                  </p>
                   <p style="margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; color: #94a3b8; text-align: center;">
-                    <a href="${unsubscribeUrl}" style="color: #94a3b8; text-decoration: underline;">Unsubscribe</a> from service notifications
+                    ${footerHtml}
                   </p>
                 </td>
               </tr>
@@ -601,7 +621,6 @@ async function sendTemplatedEmail({
 
   const textContent = `
 ${senderName}
-YOUR SERVICE SUMMARY
 
 ${greeting}
 
@@ -611,7 +630,6 @@ ${closing}
 
 ---
 ${footer}
-To unsubscribe: ${unsubscribeUrl}
   `.trim();
 
   // Dry-run: return the rendered payload without sending.
