@@ -1,3 +1,4 @@
+import { mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import readline from 'readline';
@@ -33,7 +34,9 @@ function writeSendReport(records, clients) {
     XLSX.utils.book_append_sheet(wb, ws, 'Send Report');
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const suffix = clients ? clients.join('_') : 'all';
-    const outPath = join(__dirname, `send-report-${suffix}-${stamp}.xlsx`);
+    const outDir = join(__dirname, 'send-reports');
+    mkdirSync(outDir, { recursive: true });
+    const outPath = join(outDir, `send-report-${suffix}-${stamp}.xlsx`);
     XLSX.writeFile(wb, outPath);
     console.log(`[price-increase-notification-job] Wrote send report: ${outPath}`);
 }
