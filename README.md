@@ -1,13 +1,13 @@
 # Price Increase Notification Job
 
-Standalone Cloud Run Job for daily pre-push customer price increase emails.
+Standalone Cloud Run Job that sends pre-push customer price increase emails. Runs on demand — invoked by the client-ops-pilot app via the Cloud Run Jobs API, not on a schedule.
 
 ## What it does
 
-On each run, the job:
+On each invocation, the job:
 
-1. Finds the latest published PlanV2 plan for each client.
-2. Finds rollout periods whose derived `noticeDate` is due on the job date.
+1. Finds the latest published PlanV2 plan for each client (or just the clients passed in `NOTIFICATION_CLIENTS`).
+2. Finds rollout periods whose derived `noticeDate` is due on the target date.
 3. Builds pre-push notification recipients from the published pricing workflow.
 4. Sends emails only to eligible targets.
 5. Skips already-sent accounts using the existing notification event tables.
@@ -15,7 +15,7 @@ On each run, the job:
 Due rule:
 
 - `noticeDate <= targetDate <= effectiveDate`
-- `targetDate` defaults to the current UTC date
+- `targetDate` defaults to the current UTC date; pass `NOTIFICATION_TARGET_DATE` to override
 
 ## Repo layout
 
@@ -43,6 +43,10 @@ Optional environment:
   - Audit label written to notification events. Default: `cloud_run_job`
 - `NOTIFICATION_TEST_RECIPIENT`
   - Sends all due emails to one inbox and records them as `test_pre_push`, so real sends are not blocked later.
+- `NOTIFICATION_LIMIT`
+  - Cap the number of sends in a single invocation.
+- `NOTIFICATION_AUTO_CONFIRM`
+  - Set `true` to skip the interactive preflight. The deployed Cloud Run Job sets this. Local runs leave it unset to walk through the prompts.
 - `BIGQUERY_CREDENTIALS_FILE`
   - Optional for local runs only if you are not using ADC.
 - `USE_ADC`
@@ -84,12 +88,7 @@ docker push us-central1-docker.pkg.dev/PROJECT_ID/client-ops-pilot/price-increas
 
 ## Deploy Cloud Run Job
 
-Replace the placeholders before running:
-
-- `PROJECT_ID`
-- `CLOUDSQL_INSTANCE`
-- `APP_URL_VALUE`
-- `SERVICE_ACCOUNT_EMAIL` if you want a dedicated runtime service account
+Use `scripts/deploy_to_gcp.ps1`, or run the equivalent command:
 
 ```bash
 gcloud run jobs deploy price-increase-notification \
@@ -97,7 +96,7 @@ gcloud run jobs deploy price-increase-notification \
   --region us-central1 \
   --image us-central1-docker.pkg.dev/PROJECT_ID/client-ops-pilot/price-increase-notification:latest \
   --service-account SERVICE_ACCOUNT_EMAIL \
-  --set-env-vars BQ_PROJECT=PROJECT_ID,APP_URL=APP_URL_VALUE,NOTIFICATION_SENT_BY=cloud_run_job \
+  --set-env-vars BQ_PROJECT=PROJECT_ID,APP_URL=APP_URL_VALUE,NOTIFICATION_SENT_BY=cloud_run_job,NOTIFICATION_AUTO_CONFIRM=true \
   --set-env-vars CLOUDSQL_HOST=/cloudsql/PROJECT_ID:us-central1:CLOUDSQL_INSTANCE,CLOUDSQL_DATABASE=client_ops,CLOUDSQL_USER=postgres \
   --set-secrets CLOUDSQL_PASSWORD=CLOUDSQL_PASSWORD:latest,MAILERSEND_API_KEY=MAILERSEND_API_KEY:latest \
   --set-cloudsql-instances PROJECT_ID:us-central1:CLOUDSQL_INSTANCE \
@@ -105,7 +104,9 @@ gcloud run jobs deploy price-increase-notification \
   --max-retries 1
 ```
 
-## Test execute
+`NOTIFICATION_AUTO_CONFIRM=true` is required on the deployed Job — without it the interactive preflight in [main.js](main.js) will hang on `readline` because Cloud Run has no stdin.
+
+## Manually execute (smoke test)
 
 ```bash
 gcloud run jobs execute price-increase-notification \
@@ -113,42 +114,89 @@ gcloud run jobs execute price-increase-notification \
   --region us-central1
 ```
 
-Tail logs:
+## Invoke from another service
 
-```bash
-gcloud logging read "resource.type=cloud_run_job" \
-  --project PROJECT_ID \
-  --limit 50 \
-  --freshness 6h
+The client-ops-pilot app triggers a run by POSTing to the Cloud Run Jobs `:run` endpoint. Per-execution inputs (target date, client list, test recipient, send limit) are passed as env-var overrides — they don't change the deployed Job spec.
+
+Endpoint:
+
+```
+POST https://run.googleapis.com/v2/projects/PROJECT_ID/locations/us-central1/jobs/price-increase-notification:run
 ```
 
-## Schedule daily
+Auth: the calling service account needs `roles/run.invoker` on the Job. With Google Auth libraries this is usually a `GoogleAuth` client requesting an access token for `https://www.googleapis.com/auth/cloud-platform`.
 
-Create a Cloud Scheduler job that calls the Cloud Run Jobs API once per day.
+Body — overrides apply only to this one execution:
+
+```json
+{
+  "overrides": {
+    "containerOverrides": [
+      {
+        "env": [
+          { "name": "NOTIFICATION_CLIENTS",       "value": "MODERN" },
+          { "name": "NOTIFICATION_TARGET_DATE",   "value": "2026-12-01" },
+          { "name": "NOTIFICATION_SENT_BY",       "value": "client_ops_pilot:user@example.com" },
+          { "name": "NOTIFICATION_TEST_RECIPIENT","value": "qa@example.com" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Response shape (abbreviated):
+
+```json
+{
+  "name": "projects/PROJECT_NUMBER/locations/us-central1/jobs/price-increase-notification/executions/price-increase-notification-abcde",
+  "metadata": { "@type": "type.googleapis.com/google.cloud.run.v2.Execution", "...": "..." }
+}
+```
+
+The last segment of `name` (e.g. `price-increase-notification-abcde`) is the **execution name** — keep it; that's how you scope the logs for this particular run.
+
+### Tracking progress via logs
+
+The job emits structured progress lines on stdout, all prefixed with `[price-increase-notification-job]`:
+
+- start: `Starting targetDate=… clients=… testRecipient=… sendLimit=… autoConfirm=…`
+- per period: `status=… client=… effectivePeriod=… eligible=… sent=… failed=… …`
+- end: `Complete targetDate=… duePeriods=… processedPeriods=… eligible=… sent=… failed=…`
+
+Filter Cloud Logging for one execution:
+
+```
+resource.type="cloud_run_job"
+resource.labels.job_name="price-increase-notification"
+labels."run.googleapis.com/execution_name"="EXECUTION_NAME_FROM_RESPONSE"
+```
+
+Or via gcloud:
 
 ```bash
-gcloud scheduler jobs create http price-increase-notification-daily \
+gcloud logging read \
+  'resource.type="cloud_run_job" AND labels."run.googleapis.com/execution_name"="EXECUTION_NAME_FROM_RESPONSE"' \
   --project PROJECT_ID \
-  --location us-central1 \
-  --schedule "0 9 * * *" \
-  --time-zone "America/Chicago" \
-  --http-method POST \
-  --uri "https://run.googleapis.com/v2/projects/PROJECT_ID/locations/us-central1/jobs/price-increase-notification:run" \
-  --oauth-service-account-email SCHEDULER_SERVICE_ACCOUNT_EMAIL
+  --order=asc \
+  --format='value(textPayload)'
 ```
+
+The execution's overall completion + exit code are also visible via the Executions API (`projects/.../executions/EXECUTION_NAME`) — `status.completionTime`, `status.failedCount`, `status.succeededCount`. The job exits non-zero if any send failed, so a failed execution surfaces there too.
 
 ## Required IAM
 
-Runtime service account:
+Runtime service account (the one the Job runs as):
 
 - `roles/cloudsql.client`
 - `roles/bigquery.jobUser`
 - `roles/bigquery.dataViewer`
 - `roles/secretmanager.secretAccessor`
 
-Scheduler service account:
+Caller service account (the one client-ops-pilot uses to invoke the Job):
 
-- permission to run the Cloud Run Job
+- `roles/run.invoker` on the Job
+- `roles/logging.viewer` (or `roles/logging.privateLogViewer`) if it also reads the execution logs back
 
 ## Failure behavior
 
@@ -158,6 +206,4 @@ Scheduler service account:
 ## Helper scripts
 
 - `scripts/deploy_to_gcp.ps1`
-  - builds the image, pushes it, deploys the Cloud Run Job, and executes it once
-- `scripts/create_daily_scheduler.ps1`
-  - creates the daily Cloud Scheduler trigger
+  - builds the image, pushes it, and deploys the Cloud Run Job

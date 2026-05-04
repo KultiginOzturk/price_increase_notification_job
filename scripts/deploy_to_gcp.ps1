@@ -31,7 +31,7 @@ gcloud run jobs deploy $JOB_NAME `
   --region $REGION `
   --image $IMAGE_URI `
   --service-account $RUNTIME_SERVICE_ACCOUNT `
-  --set-env-vars "BQ_PROJECT=$PROJECT_ID,APP_URL=$APP_URL,NOTIFICATION_SENT_BY=cloud_run_job" `
+  --set-env-vars "BQ_PROJECT=$PROJECT_ID,APP_URL=$APP_URL,NOTIFICATION_SENT_BY=cloud_run_job,NOTIFICATION_AUTO_CONFIRM=true" `
   --set-env-vars "CLOUDSQL_HOST=/cloudsql/${CLOUDSQL_CONNECTION},CLOUDSQL_DATABASE=client_ops,CLOUDSQL_USER=postgres" `
   --set-secrets "CLOUDSQL_PASSWORD=CLOUDSQL_PASSWORD:latest,MAILERSEND_API_KEY=MAILERSEND_API_KEY:latest" `
   --set-cloudsql-instances $CLOUDSQL_CONNECTION `

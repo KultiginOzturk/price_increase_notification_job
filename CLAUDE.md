@@ -1,10 +1,10 @@
 # CLAUDE.md — agent orientation
 
-Operational docs (deploy, env vars, scheduling, IAM) live in [README.md](README.md). This file is the architecture map and gotcha list for code work.
+Operational docs (deploy, env vars, invocation, IAM) live in [README.md](README.md). This file is the architecture map and gotcha list for code work.
 
 ## What this repo is
 
-A standalone Cloud Run Job that runs once per day and sends pre-push price-increase emails to customers whose rollout is "due today". It is a slimmed-down extraction of the main Client-Ops app — it shares table contracts, services, and a few utilities with that app, but runs independently.
+A standalone Cloud Run Job that sends pre-push price-increase emails to customers whose rollout is "due" on the target date. It runs **on demand** — invoked by the client-ops-pilot app via the Cloud Run Jobs `:run` API, not on a schedule. Each invocation processes one target date (today by default, overridable via `NOTIFICATION_TARGET_DATE`). It is a slimmed-down extraction of the main Client-Ops app — it shares table contracts, services, and a few utilities with that app, but runs independently.
 
 The runtime is **Node 20, ESM** (`"type": "module"` in [package.json](package.json)). Top-level `await` is used in entry files and dynamic-import scripts.
 
@@ -16,7 +16,7 @@ The runtime is **Node 20, ESM** (`"type": "module"` in [package.json](package.js
 | [main.js](main.js) | The job. Reads env, calls `runDuePrePushNotifications`, runs interactive preflight, writes `send-report-*.xlsx`, exits non-zero on any send failure. |
 | [test-send-one.js](test-send-one.js) | Sends one hardcoded sample email to `TEST_TO`. Used to verify MailerSend / sender config end-to-end. |
 | [export-eligible.js](export-eligible.js) | Dry-run: dumps the eligible-target list for a client to xlsx without sending. |
-| [send-correction.js](send-correction.js) | One-off correction-email sender (a previous incident remediation script). Not part of the daily job. |
+| [send-correction.js](send-correction.js) | One-off correction-email sender (a previous incident remediation script). Not part of the regular notification job. |
 
 The "real work" entry into the service layer is [`runDuePrePushNotifications`](services/priceIncreaseNotificationService.js#L941) — every entry point above ultimately funnels through it (or its sub-functions).
 
@@ -93,7 +93,7 @@ Operator-only — not bundled into the Cloud Run image's entry point. Each loads
 - [scripts/backfillEvents.js](scripts/backfillEvents.js) — replays historical periods to populate `inp_price_increase_notification_events`. See `scripts/backfill-log.txt` for past runs.
 - [scripts/countOfficeSends.js](scripts/countOfficeSends.js) — quick send-count breakdown by office for spot checks.
 - [scripts/enrichBouncedCustomers.js](scripts/enrichBouncedCustomers.js) — joins MailerSend bounce activity exports against customer records.
-- [scripts/deploy_to_gcp.ps1](scripts/deploy_to_gcp.ps1), [scripts/create_daily_scheduler.ps1](scripts/create_daily_scheduler.ps1) — deploy/schedule helpers (Windows PowerShell).
+- [scripts/deploy_to_gcp.ps1](scripts/deploy_to_gcp.ps1) — build + deploy the Cloud Run Job (Windows PowerShell).
 
 ## Local development
 
