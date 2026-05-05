@@ -5,6 +5,16 @@ import { runQuery } from '../utils/bigquery.js';
 import { deriveTimingFromPeriod } from '../routes/planV2/timing.js';
 import { sendPriceIncreaseEmail, validateEmails } from './emailService.js';
 import { PLAN_V2_PUSH_REVIEW_TABS, buildPlanV2PricePushSource } from './planV2PricePushService.js';
+import logger from '../lib/logger.js';
+import { loadActiveNotificationConfig } from './pricingPipeline/notification/configLoader.js';
+import {
+    openNotificationRun,
+    insertNotificationRecipient,
+    updateNotificationRecipientOutcome,
+    closeNotificationRun,
+} from './pricingPipeline/notification/runRepo.js';
+import { emitNotificationSendEvent } from './pricingPipeline/notification/sendEventRecorder.js';
+import { transition as transitionJourneyState } from './pricingPipeline/push/journeyStateRepo.js';
 
 const PRE_PUSH_MODE = 'pre_push';
 const POST_PUSH_MODE = 'post_push';
@@ -644,6 +654,67 @@ export async function sendNotificationTargets({
     const eventRows = [];
     const legacyRows = [];
 
+    // Open a notification_run + capture per-recipient outcomes.
+    // Goal: every send (and every skip) produces (a) a notification_recipient
+    // PG row + (b) a notification_send_event BQ row with the rendered email
+    // payload. The trace UI joins the two via (bq_payload_dataset, row_id).
+    //
+    // Graceful degradation: if office_notification_config isn't backfilled,
+    // skip the new audit and continue with the legacy path.
+    let notificationRunId = null;
+    let notificationConfigVersionId = null;
+    const firstTarget = selectedTargets[0] ?? null;
+    const planIdForRun = firstTarget?.planId ?? null;
+    const effectivePeriodForRun = firstTarget?.effectivePeriod ?? '';
+    if (planIdForRun) {
+        try {
+            const notifConfig = await loadActiveNotificationConfig(client);
+            notificationConfigVersionId = notifConfig.versionId;
+            const opened = await openNotificationRun({
+                planId:           Number(planIdForRun),
+                officeKey:        client,
+                mode,
+                effectivePeriod:  effectivePeriodForRun,
+                configVersionId:  notifConfig.versionId,
+                triggeredBy:      sentBy,
+            });
+            notificationRunId = opened.id;
+            logger.info(
+                { office_key: client, plan_id: planIdForRun, mode, notification_run_id: notificationRunId, notification_config_version_id: notificationConfigVersionId, total: selectedTargets.length },
+                '[notification] run opened',
+            );
+        } catch (err) {
+            logger.warn(
+                { err: err?.message || String(err), office_key: client, plan_id: planIdForRun },
+                '[notification] no office_notification_config; skipping new audit (legacy path continues)',
+            );
+        }
+    }
+
+    const recordRecipient = async ({ target, email, status, statusNote }) => {
+        if (!notificationRunId) return null;
+        try {
+            const row = await insertNotificationRecipient({
+                notificationRunId,
+                masterAccountId: target.masterAccountId,
+                recipientEmail:  email ?? '(missing)',
+                status,
+                statusNote: statusNote ?? null,
+            });
+            return row.id;
+        } catch (err) {
+            logger.warn(
+                { err: err?.message || String(err), office_key: client, master_account_id: target.masterAccountId, status },
+                '[notification] failed to insert notification_recipient',
+            );
+            return null;
+        }
+    };
+
+    let auditSucceeded = 0;
+    let auditFailed = 0;
+    let auditSuppressed = 0;
+
     for (const target of selectedTargets) {
         const detail = {
             selectionId: target.selectionId,
@@ -673,6 +744,8 @@ export async function sendNotificationTargets({
                 service_count: target.services.length,
                 sent_by: sentBy,
             });
+            await recordRecipient({ target, email: target.email, status: 'suppressed_no_email' });
+            auditSuppressed++;
             continue;
         }
 
@@ -697,6 +770,13 @@ export async function sendNotificationTargets({
                 service_count: target.services.length,
                 sent_by: sentBy,
             });
+            await recordRecipient({
+                target,
+                email: target.email,
+                status: 'suppressed_unsubscribed',
+                statusNote: 'excluded_tag',
+            });
+            auditSuppressed++;
             continue;
         }
 
@@ -721,6 +801,8 @@ export async function sendNotificationTargets({
                 service_count: target.services.length,
                 sent_by: sentBy,
             });
+            await recordRecipient({ target, email: target.email, status: 'suppressed_unsubscribed' });
+            auditSuppressed++;
             continue;
         }
 
@@ -745,6 +827,8 @@ export async function sendNotificationTargets({
                 service_count: target.services.length,
                 sent_by: sentBy,
             });
+            await recordRecipient({ target, email: target.email, status: 'deduped_already_sent' });
+            auditSuppressed++;
             continue;
         }
 
@@ -782,6 +866,14 @@ export async function sendNotificationTargets({
 
         const actualRecipientEmail = testRecipient || target.email;
 
+        // Record-as-queued before the send so a crash mid-batch leaves a
+        // visible "we got this far" audit row instead of a missing record.
+        const notificationRecipientId = await recordRecipient({
+            target,
+            email: actualRecipientEmail,
+            status: 'queued',
+        });
+
         const sendResult = await sendPriceIncreaseEmail({
             recipient: actualRecipientEmail,
             recipientName: target.customerName,
@@ -806,9 +898,94 @@ export async function sendNotificationTargets({
         if (sendResult.success) {
             results.sent++;
             results.details.push({ ...detail, status: statusLabel, email: actualRecipientEmail || undefined, testMode: !!testRecipient });
+            auditSucceeded++;
         } else {
             results.failed++;
             results.details.push({ ...detail, status: statusLabel, email: actualRecipientEmail || undefined, error: errorMessage });
+            auditFailed++;
+        }
+
+        // Capture rendered payload to BQ + update PG outcome row.
+        if (notificationRunId && notificationRecipientId) {
+            const sentAt = new Date();
+            const rendered = sendResult.rendered ?? null;
+            const bqPayloadDataset = `rcp_${client}`;
+            const bqPayloadRowId = `${notificationRunId}:${notificationRecipientId}`;
+
+            if (sendResult.success && rendered) {
+                try {
+                    await emitNotificationSendEvent({
+                        notification_run_id:        notificationRunId,
+                        notification_recipient_id:  notificationRecipientId,
+                        office_key:                 client,
+                        master_account_id:          target.masterAccountId,
+                        recipient_email:            actualRecipientEmail,
+                        provider:                   'mailersend',
+                        provider_message_id:        messageId,
+                        subject:                    rendered.subject,
+                        html_body:                  rendered.htmlBody,
+                        text_body:                  rendered.textBody,
+                        template_id:                senderConfig?.templateConfig?.notification_template_id ?? null,
+                        template_variables:         rendered.templateVariables,
+                        provider_request: {
+                            from:        rendered.senderEmail,
+                            from_name:   rendered.senderName,
+                            to:          rendered.recipient,
+                            cc:          rendered.cc,
+                            bcc:         rendered.bcc,
+                            reply_to:    rendered.replyToEmail,
+                            mode:        rendered.mode,
+                            unsubscribe_url: unsubscribeUrl,
+                        },
+                        provider_response: {
+                            message_id:     messageId,
+                            mock:           Boolean(sendResult.mock),
+                            cc_bcc_failed:  Boolean(sendResult.ccBccFailed),
+                        },
+                        sent_at: sentAt,
+                    });
+                } catch (bqErr) {
+                    logger.warn(
+                        { err: bqErr?.message || String(bqErr), office_key: client, master_account_id: target.masterAccountId, notification_run_id: notificationRunId },
+                        '[notification] notification_send_event BQ insert failed; PG audit row still recorded',
+                    );
+                }
+            }
+
+            await updateNotificationRecipientOutcome({
+                id: notificationRecipientId,
+                status: sendResult.success ? (testRecipient ? 'test' : 'sent') : 'failed',
+                statusNote: errorMessage,
+                providerMessageId: messageId,
+                bqPayloadDataset: sendResult.success ? bqPayloadDataset : null,
+                bqPayloadRowId:   sendResult.success ? bqPayloadRowId : null,
+                sentAt: sendResult.success ? sentAt : null,
+            }).catch((updErr) => {
+                logger.warn(
+                    { err: updErr?.message || String(updErr), notification_recipient_id: notificationRecipientId },
+                    '[notification] notification_recipient outcome update failed',
+                );
+            });
+
+            // Step 8b: pre-push real sends advance journey state to 'notified'.
+            // Skip for test sends (testRecipient) and post-push (already past notified).
+            if (sendResult.success && !testRecipient && mode === PRE_PUSH_MODE && planIdForRun) {
+                try {
+                    await transitionJourneyState({
+                        planId: Number(planIdForRun),
+                        masterAccountId: target.masterAccountId,
+                        to: 'notified',
+                        enteredBy: sentBy,
+                        note: `notification_run=${notificationRunId}`,
+                        allowInsert: true,
+                    });
+                } catch (jsErr) {
+                    logger.warn(
+                        { err: jsErr?.message || String(jsErr), plan_id: planIdForRun, master_account_id: target.masterAccountId },
+                        '[notification] journey-state transition to notified failed',
+                    );
+                }
+            }
         }
 
         const eventRow = {
@@ -863,6 +1040,34 @@ export async function sendNotificationTargets({
                 (id, client, queue_id, master_account_id, recipient_email, recipient_name, status, error_message, mailersend_message_id, subscription_count, sent_by, created_at)
             VALUES ${buildLegacyInsertSql(legacyRows)}
         `, {}, 'price-increase-notify-insert-legacy');
+    }
+
+    if (notificationRunId) {
+        try {
+            await closeNotificationRun({
+                id:               notificationRunId,
+                totalRecipients:  selectedTargets.length,
+                succeededCount:   auditSucceeded,
+                failedCount:      auditFailed,
+                suppressedCount:  auditSuppressed,
+            });
+            logger.info(
+                {
+                    notification_run_id: notificationRunId,
+                    notification_config_version_id: notificationConfigVersionId,
+                    total: selectedTargets.length,
+                    succeeded: auditSucceeded,
+                    failed: auditFailed,
+                    suppressed: auditSuppressed,
+                },
+                '[notification] run closed',
+            );
+        } catch (closeErr) {
+            logger.warn(
+                { err: closeErr?.message || String(closeErr), notification_run_id: notificationRunId },
+                '[notification] run close failed; counts may be inaccurate',
+            );
+        }
     }
 
     return results;

@@ -312,6 +312,38 @@ function billingFrequencyToLabel(freq, servicesPerYear = null) {
  * Single source of truth for default template text.
  * Frontend DEFAULTS in NotificationSettings.tsx must match these values.
  */
+/**
+ * Compute the dominant billing frequency across a set of services. If all
+ * services share a frequency, that's the dominant. Mixed-frequency batches
+ * (rare) fall back to the most common; ties broken by the highest
+ * chargesPerYear (the most granular cycle, since communicating in a
+ * smaller-than-actual cycle is gentler than the reverse).
+ *
+ * @param {Array<Object>} services
+ * @returns {{ label: string, chargesPerYear: number|null }}
+ */
+function computeDominantBillingFrequency(services) {
+    if (!Array.isArray(services) || services.length === 0) {
+        return { label: 'per month', chargesPerYear: 12 };
+    }
+    const counts = new Map();
+    for (const svc of services) {
+        const billing = billingFrequencyToLabel(
+            svc.billingFrequency ?? svc.billing_frequency,
+            svc.servicesPerYear ?? svc.services_per_year,
+        );
+        const key = `${billing.label}|${billing.chargesPerYear ?? 'null'}`;
+        const prev = counts.get(key) ?? { ...billing, count: 0 };
+        prev.count++;
+        counts.set(key, prev);
+    }
+    const sorted = [...counts.values()].sort((a, b) => {
+        if (b.count !== a.count) return b.count - a.count;
+        return (b.chargesPerYear ?? 0) - (a.chargesPerYear ?? 0);
+    });
+    return { label: sorted[0].label, chargesPerYear: sorted[0].chargesPerYear };
+}
+
 const DEFAULT_TEMPLATE = {
   notification_subject: 'Your Service Summary - {company_name}',
   notification_greeting: 'Hi {first_name},',
@@ -410,6 +442,23 @@ export function computeEmailVariables({
   const avgMonthlyIncrease = serviceCount > 0 ? totalMonthlyIncrease / serviceCount : 0;
   const avgQuarterlyIncrease = serviceCount > 0 ? totalQuarterlyIncrease / serviceCount : 0;
 
+  // Per-cycle math (Step 7 fix to the hardcoded /4 bug).
+  // Quarterly-as-calendar-quarter (annual/4) is correct for time-equivalent
+  // expressions, but customers care about *their* billing cycle — a monthly-
+  // billed customer should see "$X / month", not "$Y / quarter".
+  const dominantFreq = computeDominantBillingFrequency(nonZeroServices);
+  const perCycleLabel = dominantFreq.label;
+  const perCycleChargesPerYear = dominantFreq.chargesPerYear || 12;
+  const perCycleIncrease = perCycleChargesPerYear > 0
+    ? totalAnnualIncrease / perCycleChargesPerYear
+    : totalMonthlyIncrease;
+  const currentPerCycleTotal = perCycleChargesPerYear > 0
+    ? totalAnnualCurrent / perCycleChargesPerYear
+    : currentMonthlyTotal;
+  const newPerCycleTotal = perCycleChargesPerYear > 0
+    ? totalAnnualNew / perCycleChargesPerYear
+    : newMonthlyTotal;
+
   // Base variables available in ALL templates (single + multi)
   const baseVars = {
     first_name: firstName || (customerName ? customerName.split(' ')[0] : ''),
@@ -423,6 +472,14 @@ export function computeEmailVariables({
     // Per-cadence aggregates — available in both modes
     monthly_increase: formatUSD(totalMonthlyIncrease),
     quarterly_increase: formatUSD(totalQuarterlyIncrease),
+    // Step 7 fix: per-cycle aggregates derived from the customer's actual
+    // billing frequency. Templates should prefer {per_cycle_increase} +
+    // {per_cycle_label} over the bare {monthly_increase} / {quarterly_increase}
+    // when they want to address the customer in the cadence they're billed in.
+    per_cycle_increase: formatUSD(perCycleIncrease),
+    per_cycle_label: perCycleLabel,
+    current_per_cycle_total: formatUSD(currentPerCycleTotal),
+    new_per_cycle_total: formatUSD(newPerCycleTotal),
     current_monthly_total: formatUSD(currentMonthlyTotal),
     current_quarterly_total: formatUSD(currentQuarterlyTotal),
     new_monthly_total: formatUSD(newMonthlyTotal),
@@ -632,17 +689,38 @@ ${closing}
 ${footer}
   `.trim();
 
+  // Caller (priceIncreaseNotificationService) needs the rendered payload to
+  // persist a notification_send_event in BQ. Bundle everything we produced
+  // here so the audit trail can show the operator the exact email that went
+  // out.
+  const ccListEmails = (raw) => {
+    if (!raw) return [];
+    return String(raw)
+      .split(',')
+      .map((e) => e.trim())
+      .filter((e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
+  };
+  const renderedPayload = {
+    subject,
+    htmlBody: htmlContent,
+    textBody: textContent,
+    mode,
+    templateVariables: variables,
+    senderEmail,
+    senderName,
+    recipient,
+    recipientName: recipientName || null,
+    cc: ccListEmails(templateConfig.notification_cc),
+    bcc: ccListEmails(templateConfig.notification_bcc),
+    replyToEmail: templateConfig.notification_client_email?.trim() || replyTo || null,
+  };
+
   // Dry-run: return the rendered payload without sending.
   if (dryRun) {
     return {
       success: true,
       dryRun: true,
-      rendered: {
-        subject, textContent, htmlContent,
-        senderEmail, senderName, replyTo: replyTo || null,
-        recipient, recipientName: recipientName || null,
-        mode,
-      },
+      rendered: renderedPayload,
     };
   }
 
@@ -651,7 +729,12 @@ ${footer}
     console.log('[EmailService] Would send templated price increase email to:', recipient);
     console.log('[EmailService] Subject:', subject);
     console.log('[EmailService] Mode:', mode);
-    return { success: true, messageId: 'mock-' + Date.now() };
+    return {
+      success: true,
+      messageId: 'mock-' + Date.now(),
+      mock: true,
+      rendered: renderedPayload,
+    };
   }
 
   // Parse CC/BCC
@@ -685,7 +768,7 @@ ${footer}
 
     const messageId = await sendWithParams(emailParams);
     console.log(`[EmailService] Templated price increase email sent to ${recipient}. MessageId: ${messageId}`);
-    return { success: true, messageId };
+    return { success: true, messageId, rendered: renderedPayload };
   } catch (error) {
     // CC/BCC resilience: if send fails and we had CC/BCC, retry without them
     if (ccList.length > 0 || bccList.length > 0) {
@@ -704,19 +787,19 @@ ${footer}
 
         const messageId = await sendWithParams(retryParams);
         console.log(`[EmailService] Retry without CC/BCC succeeded for ${recipient}. MessageId: ${messageId}`);
-        return { success: true, messageId, ccBccFailed: true };
+        return { success: true, messageId, ccBccFailed: true, rendered: renderedPayload };
       } catch (retryError) {
         const body = retryError?.response?.body ?? retryError?.body;
         const msg = body?.message ?? (typeof body === 'string' ? body : JSON.stringify(body ?? retryError?.message ?? retryError));
         console.error(`[EmailService] Retry also failed for ${recipient}:`, msg);
-        return { success: false, error: msg };
+        return { success: false, error: msg, rendered: renderedPayload };
       }
     }
 
     const body = error?.response?.body ?? error?.body;
     const msg = body?.message ?? (typeof body === 'string' ? body : JSON.stringify(body ?? error?.message ?? error));
     console.error(`[EmailService] Failed to send templated email to ${recipient}:`, msg);
-    return { success: false, error: msg };
+    return { success: false, error: msg, rendered: renderedPayload };
   }
 }
 
