@@ -205,11 +205,24 @@ async function main() {
     const testRecipient = process.env.NOTIFICATION_TEST_RECIPIENT || null;
     const sendLimit = process.env.NOTIFICATION_LIMIT ? parseInt(process.env.NOTIFICATION_LIMIT, 10) : null;
     const autoConfirm = /^(1|true|yes)$/i.test(String(process.env.NOTIFICATION_AUTO_CONFIRM || ''));
+    // NOTIFICATION_ACCOUNT_IDS — comma-separated master_account_id allowlist.
+    // Set by the app-triggered cohort send; absent for the scheduled cron.
+    const accountIds = (process.env.NOTIFICATION_ACCOUNT_IDS || '')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean);
+    // NOTIFICATION_RUN_ID — reuse an app-created notification_run instead of
+    // opening a fresh one. Set by the client-ops-pilot /launch/notify batch
+    // trigger so the app keeps tracking the same run row; absent for the cron.
+    const existingRunId = process.env.NOTIFICATION_RUN_ID
+        ? Number(process.env.NOTIFICATION_RUN_ID)
+        : null;
 
     console.log(
         `[price-increase-notification-job] Starting targetDate=${targetDate || 'today'} ` +
         `clients=${clients ? clients.join(',') : 'all'} testRecipient=${testRecipient || 'none'} ` +
-        `sendLimit=${sendLimit ?? 'none'} autoConfirm=${autoConfirm}`
+        `sendLimit=${sendLimit ?? 'none'} accountIds=${accountIds.length || 'all'} ` +
+        `runId=${existingRunId ?? 'none'} autoConfirm=${autoConfirm}`
     );
 
     const summary = await runDuePrePushNotifications({
@@ -219,6 +232,8 @@ async function main() {
         sentBy,
         testRecipient,
         sendLimit,
+        accountIds: accountIds.length > 0 ? accountIds : null,
+        existingRunId,
         preflight: autoConfirm ? null : interactivePreflight,
     });
 

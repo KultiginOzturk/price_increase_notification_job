@@ -1,23 +1,60 @@
+#
+# Deploy the price-increase-notification Cloud Run Job.
+#
+# Usage:
+#   ./scripts/deploy_to_gcp.ps1                       # deploys to pco-dev3 (default)
+#   ./scripts/deploy_to_gcp.ps1 -Project pco-cleanup  # deploys to cleanup
+#
+# Per-project settings (service account, Artifact Registry repo, APP_URL)
+# live in $PROJECT_CONFIG below — add an entry to target a new project.
+#
+param(
+    [ValidateSet("pco-dev3", "pco-cleanup")]
+    [string]$Project = "pco-dev3"
+)
+
 $ErrorActionPreference = "Stop"
 
-# Fill these in before running.
-$PROJECT_ID = "pco-cleanup"
-$REGION = "us-central1"
-$REPOSITORY = "price-increase-notification-job"
-$IMAGE_NAME = "price-increase-notification"
-$JOB_NAME = "price-increase-notification"
+$REGION            = "us-central1"
+$IMAGE_NAME        = "price-increase-notification"
+$JOB_NAME          = "price-increase-notification"
 $CLOUDSQL_INSTANCE = "client-ops-warm-layer"
-$APP_URL = "https://clientportal.pestanalytics.com"
-$RUNTIME_SERVICE_ACCOUNT = "price-push-api-sa@pco-cleanup.iam.gserviceaccount.com"
 
-$IMAGE_URI = "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:latest"
+# ── Per-project configuration ────────────────────────────────────────────
+# repo    — Artifact Registry repository the image is pushed to
+# sa      — runtime service account for the Cloud Run Job
+# appUrl  — base URL for customer-facing unsubscribe links
+$PROJECT_CONFIG = @{
+    "pco-dev3" = @{
+        repo   = "cloud-run-jobs"
+        sa     = "price-push-api-sa@pco-dev3.iam.gserviceaccount.com"
+        appUrl = "https://client-portal-dev3-mkvc5sdqiq-uc.a.run.app"
+    }
+    "pco-cleanup" = @{
+        repo   = "price-increase-notification-job"
+        sa     = "price-push-api-sa@pco-cleanup.iam.gserviceaccount.com"
+        appUrl = "https://clientportal.pestanalytics.com"
+    }
+}
+
+$cfg = $PROJECT_CONFIG[$Project]
+if (-not $cfg) { throw "No deploy config for project '$Project'" }
+
+$PROJECT_ID              = $Project
+$REPOSITORY              = $cfg.repo
+$RUNTIME_SERVICE_ACCOUNT = $cfg.sa
+$APP_URL                 = $cfg.appUrl
+
+$IMAGE_URI          = "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:latest"
 $CLOUDSQL_CONNECTION = "${PROJECT_ID}:${REGION}:${CLOUDSQL_INSTANCE}"
 
-Write-Host "Setting gcloud project to $PROJECT_ID"
+Write-Host "Deploying price-increase-notification job"
+Write-Host "  project = $PROJECT_ID"
+Write-Host "  image   = $IMAGE_URI"
+Write-Host "  sa      = $RUNTIME_SERVICE_ACCOUNT"
+Write-Host "  appUrl  = $APP_URL"
+
 gcloud config set project $PROJECT_ID
-
-Write-Host "Using existing Artifact Registry repository $REPOSITORY"
-
 
 Write-Host "Building container image in Cloud Build: $IMAGE_URI"
 gcloud builds submit `

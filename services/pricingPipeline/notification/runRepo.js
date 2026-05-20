@@ -15,7 +15,7 @@ import { query as pgQuery } from '../../../lib/postgres.js';
 
 /**
  * @typedef {'pre_push' | 'post_push' | 'manual'} NotificationMode
- * @typedef {'pending' | 'sending' | 'completed' | 'failed'} NotificationRunStatus
+ * @typedef {'draft' | 'pending' | 'sending' | 'completed' | 'failed' | 'cancelled'} NotificationRunStatus
  * @typedef {'queued' | 'sent' | 'failed' | 'suppressed_unsubscribed' | 'suppressed_no_email' | 'deduped_already_sent' | 'test'} NotificationRecipientStatus
  */
 
@@ -50,6 +50,26 @@ export async function openNotificationRun({
         [planId, officeKey, pushRunId, mode, effectivePeriod, triggeredBy, configVersionId],
     );
     return { id: Number(result.rows[0].id) };
+}
+
+/**
+ * Flip an app-created notification_run from 'draft'/'pending' to 'sending'.
+ *
+ * Used when the price-increase-notification job is launched with
+ * NOTIFICATION_RUN_ID — the client-ops-pilot /launch/notify trigger creates
+ * the run row up front, and the job reuses it rather than opening its own.
+ * No-op once the run is past pending (already sending / completed / failed /
+ * cancelled), so a retry can't resurrect a finished run.
+ *
+ * @param {number} id
+ */
+export async function markNotificationRunSending(id) {
+    await pgQuery(
+        `UPDATE notification_run
+            SET status = 'sending'
+          WHERE id = $1 AND status IN ('draft', 'pending')`,
+        [id],
+    );
 }
 
 /**

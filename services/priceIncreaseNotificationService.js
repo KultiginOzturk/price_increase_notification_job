@@ -9,12 +9,29 @@ import logger from '../lib/logger.js';
 import { loadActiveNotificationConfig } from './pricingPipeline/notification/configLoader.js';
 import {
     openNotificationRun,
+    markNotificationRunSending,
     insertNotificationRecipient,
     updateNotificationRecipientOutcome,
     closeNotificationRun,
 } from './pricingPipeline/notification/runRepo.js';
 import { emitNotificationSendEvent } from './pricingPipeline/notification/sendEventRecorder.js';
 import { transition as transitionJourneyState } from './pricingPipeline/push/journeyStateRepo.js';
+import { emitDecisionEventsBatch } from './pricingPipeline/decisionEvents/emit.js';
+import { EMITTED_BY } from './pricingPipeline/decisionEvents/types.js';
+
+// decision_event phase='notification' codes — one event per account per send
+// run. Mirrors the inp_price_increase_notification_events status values so
+// the unified trace UI shows notification outcomes alongside eligibility /
+// pricing / push.
+const NOTIFICATION_DECISION_CODE = Object.freeze({
+    sent:                 'NOTIFICATION_SENT',
+    test:                 'NOTIFICATION_TEST',
+    failed:               'NOTIFICATION_FAILED',
+    skipped_no_email:     'NOTIFICATION_SUPPRESSED_NO_EMAIL',
+    skipped_unsubscribed: 'NOTIFICATION_SUPPRESSED_UNSUBSCRIBED',
+    skipped_already_sent: 'NOTIFICATION_SUPPRESSED_ALREADY_SENT',
+    skipped_excluded_tag: 'NOTIFICATION_SUPPRESSED_EXCLUDED_TAG',
+});
 
 const PRE_PUSH_MODE = 'pre_push';
 const POST_PUSH_MODE = 'post_push';
@@ -635,6 +652,8 @@ export async function sendNotificationTargets({
     baseUrl,
     senderConfig = {},
     testRecipient = null, // When set, overrides the real recipient email for test sends
+    existingRunId = null, // When set, reuse this app-created notification_run
+                          // instead of opening a fresh one (NOTIFICATION_RUN_ID).
 }) {
     const selectionSet = new Set((selectedIds || []).map((id) => String(id)));
     const selectedTargets = targets.filter((target) => selectionSet.has(String(target.selectionId)));
@@ -654,10 +673,14 @@ export async function sendNotificationTargets({
     const eventRows = [];
     const legacyRows = [];
 
-    // Open a notification_run + capture per-recipient outcomes.
+    // Open (or reuse) a notification_run + capture per-recipient outcomes.
     // Goal: every send (and every skip) produces (a) a notification_recipient
     // PG row + (b) a notification_send_event BQ row with the rendered email
     // payload. The trace UI joins the two via (bq_payload_dataset, row_id).
+    //
+    // When existingRunId is set (NOTIFICATION_RUN_ID — the client-ops-pilot
+    // /launch/notify batch trigger), the run row was already created by the
+    // app; reuse it and flip it pending → sending. Otherwise open a fresh run.
     //
     // Graceful degradation: if office_notification_config isn't backfilled,
     // skip the new audit and continue with the legacy path.
@@ -666,7 +689,32 @@ export async function sendNotificationTargets({
     const firstTarget = selectedTargets[0] ?? null;
     const planIdForRun = firstTarget?.planId ?? null;
     const effectivePeriodForRun = firstTarget?.effectivePeriod ?? '';
-    if (planIdForRun) {
+    if (existingRunId) {
+        // App-created batch: bind to the run id up front so even a config-load
+        // failure can't strand the run unclosed. closeNotificationRun finalizes
+        // it at the end of this function.
+        notificationRunId = Number(existingRunId);
+        try {
+            await markNotificationRunSending(notificationRunId);
+        } catch (err) {
+            logger.warn(
+                { err: err?.message || String(err), notification_run_id: notificationRunId },
+                '[notification] could not flip reused run to sending',
+            );
+        }
+        try {
+            notificationConfigVersionId = (await loadActiveNotificationConfig(client)).versionId;
+        } catch (err) {
+            logger.warn(
+                { err: err?.message || String(err), office_key: client },
+                '[notification] config load failed for reused run; decision_event config_version_id falls back to 0',
+            );
+        }
+        logger.info(
+            { office_key: client, mode, notification_run_id: notificationRunId, notification_config_version_id: notificationConfigVersionId, total: selectedTargets.length },
+            '[notification] reusing app-created run (NOTIFICATION_RUN_ID)',
+        );
+    } else if (planIdForRun) {
         try {
             const notifConfig = await loadActiveNotificationConfig(client);
             notificationConfigVersionId = notifConfig.versionId;
@@ -1034,6 +1082,60 @@ export async function sendNotificationTargets({
         `, {}, 'price-increase-notify-insert-events');
     }
 
+    // ── decision_event phase='notification' — one event per account ──────
+    // Every recipient processed in the loop above produced exactly one
+    // eventRow; fan those into the unified decision_event taxonomy so the
+    // trace UI surfaces notification outcomes per account. Non-blocking:
+    // a BQ failure here is logged, never aborts the send run.
+    if (eventRows.length > 0) {
+        const evaluatorRunId = randomUUID();
+        const evaluatedAt = new Date();
+        const decisionRows = eventRows
+            .map((row) => {
+                // eventRow.status for real sends is 'sent'/'test'/'failed';
+                // for suppressions it's 'skipped_*'. Map to a decision_code.
+                const code = NOTIFICATION_DECISION_CODE[row.status] || null;
+                if (!code) return null;
+                if (!row.master_account_id) return null;
+                return {
+                    plan_id:           row.plan_id != null ? Number(row.plan_id) : null,
+                    office_key:        client,
+                    master_account_id: String(row.master_account_id),
+                    subscription_id:   null,
+                    phase:             'notification',
+                    rule_id:           'notification_send',
+                    decision_code:     code,
+                    decision_reason:   row.error_message || null,
+                    inputs: {
+                        mode:                  row.mode,
+                        effective_period:      row.effective_period ?? null,
+                        recipient_email:       row.recipient_email ?? null,
+                        service_count:         row.service_count ?? null,
+                        mailersend_message_id: row.mailersend_message_id ?? null,
+                    },
+                    outputs:           null,
+                    // config_version_id is a REQUIRED int in the emit schema;
+                    // fall back to 0 when this office has no notification
+                    // config row (legacy path).
+                    config_version_id: Number(notificationConfigVersionId) || 0,
+                    evaluated_at:      evaluatedAt,
+                    evaluator_run_id:  evaluatorRunId,
+                    emitted_by:        EMITTED_BY.NOTIFICATION_SERVICE,
+                };
+            })
+            .filter(Boolean);
+        if (decisionRows.length > 0) {
+            try {
+                await emitDecisionEventsBatch(decisionRows);
+            } catch (deErr) {
+                logger.warn(
+                    { err: deErr?.message || String(deErr), office_key: client, count: decisionRows.length },
+                    '[notification] decision_event emit failed; per-account audit (notification_recipient + inp_price_increase_notification_events) still recorded',
+                );
+            }
+        }
+    }
+
     if (legacyRows.length > 0) {
         await runQuery(`
             INSERT INTO ${INPUTS.priceIncreaseNotifications}
@@ -1073,7 +1175,7 @@ export async function sendNotificationTargets({
     return results;
 }
 
-export async function findDuePrePushNotificationPeriods({ targetDate = null, clients = null } = {}) {
+export async function findDuePrePushNotificationPeriods({ targetDate = null, clients = null, ignoreDueDate = false } = {}) {
     const normalizedTargetDate = normalizeDateOnly(targetDate) || new Date().toISOString().slice(0, 10);
     const requestedClients = Array.isArray(clients)
         ? [...new Set(clients.map((client) => String(client || '').trim()).filter(Boolean))]
@@ -1124,23 +1226,28 @@ export async function findDuePrePushNotificationPeriods({ targetDate = null, cli
         ORDER BY client, effective_period
     `, params);
 
-    return result.rows
-        .map((row) => {
-            const timing = deriveTimingFromPeriod(row.effective_period);
-            return {
-                planId: row.plan_id ? String(row.plan_id) : null,
-                client: row.client,
-                effectivePeriod: row.effective_period,
-                accountCount: Number(row.account_count) || 0,
-                noticeDate: timing.noticeDate,
-                effectiveDate: timing.effectiveDate,
-            };
-        })
-        .filter((row) => isDuePrePushNotificationPeriod({
-            targetDate: normalizedTargetDate,
-            noticeDate: row.noticeDate,
-            effectiveDate: row.effectiveDate,
-        }));
+    const periodRows = result.rows.map((row) => {
+        const timing = deriveTimingFromPeriod(row.effective_period);
+        return {
+            planId: row.plan_id ? String(row.plan_id) : null,
+            client: row.client,
+            effectivePeriod: row.effective_period,
+            accountCount: Number(row.account_count) || 0,
+            noticeDate: timing.noticeDate,
+            effectiveDate: timing.effectiveDate,
+        };
+    });
+
+    // ignoreDueDate — app-triggered sends (NOTIFICATION_RUN_ID) bypass the
+    // notice/effective-date window: the operator explicitly chose to send
+    // this batch now. The scheduled cron keeps the date gate.
+    if (ignoreDueDate) return periodRows;
+
+    return periodRows.filter((row) => isDuePrePushNotificationPeriod({
+        targetDate: normalizedTargetDate,
+        noticeDate: row.noticeDate,
+        effectiveDate: row.effectiveDate,
+    }));
 }
 
 export async function runDuePrePushNotifications({
@@ -1150,6 +1257,13 @@ export async function runDuePrePushNotifications({
     sentBy = 'cloud_run_job',
     testRecipient = null,
     sendLimit = null,
+    accountIds = null, // optional master_account_id allowlist — when set, only
+                       // these accounts are notified. Powers the app-triggered
+                       // cohort send (client-ops-pilot /launch/notify).
+    existingRunId = null, // optional app-created notification_run id to reuse
+                          // (NOTIFICATION_RUN_ID). Consumed by the first period
+                          // that has eligible targets — the cohort filter keeps
+                          // an app batch scoped to a single period anyway.
     preflight = null, // optional async ({ period, senderConfig, counts, sample, sanity }) => boolean
 } = {}) {
     const normalizedTargetDate = normalizeDateOnly(targetDate) || new Date().toISOString().slice(0, 10);
@@ -1161,7 +1275,21 @@ export async function runDuePrePushNotifications({
     const duePeriods = await findDuePrePushNotificationPeriods({
         targetDate: normalizedTargetDate,
         clients,
+        // App-triggered batches (NOTIFICATION_RUN_ID) send the chosen period
+        // immediately — the cron's notice-date gate doesn't apply.
+        ignoreDueDate: existingRunId != null,
     });
+
+    // Cohort filter: when accountIds is a non-empty list, the run is scoped
+    // to exactly those master accounts (app-triggered send). Empty/null =
+    // the unrestricted scheduled-cron behavior.
+    const accountIdSet = Array.isArray(accountIds) && accountIds.length > 0
+        ? new Set(accountIds.map((id) => String(id).trim()).filter(Boolean))
+        : null;
+
+    // The app-created run is consumed once — by the first period that actually
+    // sends. Cleared afterwards so any further period opens its own run.
+    let runIdToReuse = existingRunId ? Number(existingRunId) : null;
 
     const summary = {
         targetDate: normalizedTargetDate,
@@ -1204,6 +1332,7 @@ export async function runDuePrePushNotifications({
         });
         let selectedIds = eligibility.targets
             .filter((target) => target.eligibility === 'eligible')
+            .filter((target) => accountIdSet == null || accountIdSet.has(String(target.masterAccountId)))
             .map((target) => target.selectionId);
 
         if (sendLimit != null) {
@@ -1347,7 +1476,9 @@ export async function runDuePrePushNotifications({
                 baseUrl: trimmedBaseUrl,
                 senderConfig,
                 testRecipient,
+                existingRunId: runIdToReuse,
             });
+            runIdToReuse = null; // consumed — later periods open their own run
 
             periodSummary.sent = result.sent;
             periodSummary.failed = result.failed;
