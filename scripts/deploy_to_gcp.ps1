@@ -62,13 +62,16 @@ gcloud builds submit `
   --tag $IMAGE_URI `
   .
 
+# PLAN_SCHEMA=renamed: the pco-dev3 / pco-cleanup warm layers use the renamed
+# plan_* tables (plan_run, plan_account_decision, ...); the job's config/tables.js
+# otherwise defaults to the legacy planv2_* names.
 Write-Host "Deploying Cloud Run Job $JOB_NAME"
 gcloud run jobs deploy $JOB_NAME `
   --project $PROJECT_ID `
   --region $REGION `
   --image $IMAGE_URI `
   --service-account $RUNTIME_SERVICE_ACCOUNT `
-  --set-env-vars "BQ_PROJECT=$PROJECT_ID,APP_URL=$APP_URL,NOTIFICATION_SENT_BY=cloud_run_job,NOTIFICATION_AUTO_CONFIRM=true" `
+  --set-env-vars "BQ_PROJECT=$PROJECT_ID,APP_URL=$APP_URL,NOTIFICATION_SENT_BY=cloud_run_job,NOTIFICATION_AUTO_CONFIRM=true,PLAN_SCHEMA=renamed" `
   --set-env-vars "CLOUDSQL_HOST=/cloudsql/${CLOUDSQL_CONNECTION},CLOUDSQL_DATABASE=client_ops,CLOUDSQL_USER=postgres" `
   --set-secrets "CLOUDSQL_PASSWORD=CLOUDSQL_PASSWORD:latest,MAILERSEND_API_KEY=MAILERSEND_API_KEY:latest" `
   --set-cloudsql-instances $CLOUDSQL_CONNECTION `
