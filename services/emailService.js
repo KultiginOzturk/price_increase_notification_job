@@ -13,7 +13,7 @@ const FROM_EMAIL = process.env.MAILERSEND_FROM_EMAIL || 'reports@pestnotificatio
 const FROM_NAME = process.env.MAILERSEND_FROM_NAME || 'Pest Analytics Reports';
 // Domain for price-increase notification "from" address (client@domain). Set for testing to a verified MailerSend test domain.
 const NOTIFICATION_FROM_DOMAIN = process.env.MAILERSEND_FROM_DOMAIN || 'pestnotifications.com';
-const MAILERSEND_MAX_REQUESTS_PER_MINUTE = Math.max(1, Number(process.env.MAILERSEND_MAX_REQUESTS_PER_MINUTE) || 10);
+const MAILERSEND_MAX_REQUESTS_PER_MINUTE = Math.max(1, Number(process.env.MAILERSEND_MAX_REQUESTS_PER_MINUTE) || 60);
 const MAILERSEND_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
 let mailerSend = null;
@@ -277,6 +277,22 @@ function resolveTemplateVariables(template, variables) {
 }
 
 /**
+ * Format a pricing_tier code (e.g. "sqft_3k_4k") into human-readable range ("3,001–4,000 sq ft").
+ * Pattern: sqft_{lo}{k?}_{hi}{k?} — lower 0 stays 0, otherwise increments by 1.
+ * Unknown formats are returned as-is; null/empty → ''.
+ */
+function formatSquareFootageTier(tier) {
+  if (!tier) return '';
+  const m = /^sqft_(\d+)(k?)_(\d+)(k?)$/.exec(String(tier));
+  if (!m) return String(tier);
+  const lo = Number(m[1]) * (m[2] ? 1000 : 1);
+  const hi = Number(m[3]) * (m[4] ? 1000 : 1);
+  const loStr = lo === 0 ? '0' : (lo + 1).toLocaleString('en-US');
+  const hiStr = hi.toLocaleString('en-US');
+  return `${loStr}–${hiStr} sq ft`; // en dash
+}
+
+/**
  * Map billing_frequency codes to human-readable labels and per-year counts.
  * Ported from DeliverAccounts.tsx billingInfo().
  */
@@ -389,9 +405,34 @@ export function computeEmailVariables({
   });
 
   // Build service_list: one line per subscription showing service type and NEW price
+  // e.g., "BiMonthly Pest — $79.50\nMonthly Mosquito — $45.00"
   const serviceList = nonZeroServices
-    .map(svc => `${svc.serviceTypeName || 'Service'} — ${formatUSD(Number(svc.newPrice) || 0)}`)
+    .map(svc => `${svc.serviceTypeName || svc.service_type_name || 'Service'} — ${formatUSD(Number(svc.newPrice) || 0)}`)
     .join('\n');
+
+  // Build service_list_and_times: like service_list but with billing frequency
+  // e.g., "BiMonthly Pest — $79.50 — per month\nMonthly Mosquito — $45.00 — per month"
+  const serviceListAndTimes = nonZeroServices
+    .map(svc => {
+      const name = svc.serviceTypeName || svc.service_type_name || 'Service';
+      const newPrice = Number(svc.newPrice) || 0;
+      const billing = billingFrequencyToLabel(
+        svc.billingFrequency ?? svc.billing_frequency,
+        svc.servicesPerYear ?? svc.services_per_year,
+      );
+      return `${name} — ${formatUSD(newPrice)} — ${billing.label}`;
+    })
+    .join('\n');
+
+  // Square-footage tier — unique set across increasing subs, formatted for display.
+  // Single tier → "3,001–4,000 sq ft". Multi distinct → "0–3,000 sq ft, 3,001–4,000 sq ft".
+  // Blank when no sub carries a tier.
+  const uniqueTiers = [...new Set(
+    nonZeroServices
+      .map(s => s.pricingTier ?? s.pricing_tier)
+      .filter(Boolean)
+  )];
+  const squareFootageTier = uniqueTiers.map(formatSquareFootageTier).filter(Boolean).join(', ');
 
   // Compute per-cadence aggregates across all non-zero subs — drives
   // {monthly_increase}, {quarterly_increase}, and the four current/new totals.
@@ -468,7 +509,10 @@ export function computeEmailVariables({
     effective_date: formatDate(effectiveDate),
     effective_month: formatMonth(effectiveDate),
     service_list: serviceList,
+    service_list_and_times: serviceListAndTimes,
     address_list: '',
+    // Square-footage pricing tier (e.g. "3,001–4,000 sq ft" or comma-joined for mixed)
+    square_footage_tier: squareFootageTier,
     // Per-cadence aggregates — available in both modes
     monthly_increase: formatUSD(totalMonthlyIncrease),
     quarterly_increase: formatUSD(totalQuarterlyIncrease),
@@ -508,6 +552,7 @@ export function computeEmailVariables({
       mode: 'single',
       variables: {
         ...baseVars,
+        service_type_name: svc.serviceTypeName || svc.service_type_name || 'Service',
         increase: formatUSD(increase),
         new_price: formatUSD(Number(svc.newPrice) || 0),
         time_unit: billing.label,

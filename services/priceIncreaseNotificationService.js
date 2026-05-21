@@ -99,6 +99,8 @@ const buildServiceRow = (service) => {
         annualCurrent: Number(service.annualCurrent ?? service.annual_current ?? service.oldArv ?? service.old_arv) || 0,
         annualNew: Number(service.annualNew ?? service.annual_new ?? service.newArv ?? service.new_arv) || 0,
         annualIncrease: Number(service.annualIncrease ?? service.annual_increase) || 0,
+        // Square-footage pricing tier (e.g. "sqft_3k_4k") for the {square_footage_tier} token.
+        pricingTier: service.pricingTier ?? service.pricing_tier ?? null,
     };
 };
 
@@ -335,13 +337,17 @@ export async function fetchPostPushNotificationTargets({ client, queueIds = null
             d.new_service_charge AS new_price,
             d.calculated_increase_pct AS increase_pct,
             SAFE_CAST(cs.billing_frequency AS INT64) AS billing_frequency,
-            cs.services_per_year
+            cs.services_per_year,
+            sm.pricing_tier
         FROM ${INPUTS.pricePushSubscriptionDetail} d
         INNER JOIN ${INPUTS.pricePushQueue} q
             ON d.queue_id = q.id AND d.client = q.client
         LEFT JOIN ${SHARED.curSubscription} cs
             ON CAST(d.subscription_id AS STRING) = CAST(cs.subscription_id AS STRING)
             AND d.client = cs.client
+        LEFT JOIN ${RCP.subscriptionMaster} sm
+            ON CAST(d.subscription_id AS STRING) = CAST(sm.subscription_id AS STRING)
+            AND d.client = sm.client
         WHERE d.client = @client
           AND d.status = 'pushed'
           AND q.status = 'pushed'
@@ -367,6 +373,7 @@ export async function fetchPostPushNotificationTargets({ client, queueIds = null
             increasePct: row.increase_pct,
             billing_frequency: row.billing_frequency,
             services_per_year: row.services_per_year,
+            pricing_tier: row.pricing_tier,
         }));
     }
 
@@ -543,10 +550,12 @@ const fetchAlreadySentKeys = async (client, mode, targets) => {
     return keys;
 };
 
-export async function annotateNotificationEligibility({ client, mode, targets, excludedTagKeys = [] }) {
+export async function annotateNotificationEligibility({ client, mode, targets, excludedTagKeys = [], skipAlreadySent = false }) {
     const [unsubscribedEmails, alreadySentKeys, excludedTagsByAccount] = await Promise.all([
         fetchUnsubscribedEmails(client, targets.map((target) => target.email)),
-        fetchAlreadySentKeys(client, mode, targets),
+        // skipAlreadySent — operator correction re-send: bypass the already-sent
+        // dedup so recipients who already got the original are notified again.
+        skipAlreadySent ? Promise.resolve(new Set()) : fetchAlreadySentKeys(client, mode, targets),
         fetchExcludedAccountTags(client, targets.map((target) => target.masterAccountId), excludedTagKeys),
     ]);
 
@@ -1265,6 +1274,10 @@ export async function runDuePrePushNotifications({
                           // that has eligible targets — the cohort filter keeps
                           // an app batch scoped to a single period anyway.
     preflight = null, // optional async ({ period, senderConfig, counts, sample, sanity }) => boolean
+    resend = false,   // operator correction re-send: bypass BOTH the already-sent
+                      // dedup and the notice/effective-date due window, so a batch
+                      // that already went out can be re-sent (e.g. a corrected
+                      // template). Off for the cron and all normal sends.
 } = {}) {
     const normalizedTargetDate = normalizeDateOnly(targetDate) || new Date().toISOString().slice(0, 10);
     const trimmedBaseUrl = typeof baseUrl === 'string' ? baseUrl.trim().replace(/\/+$/, '') : '';
@@ -1275,9 +1288,10 @@ export async function runDuePrePushNotifications({
     const duePeriods = await findDuePrePushNotificationPeriods({
         targetDate: normalizedTargetDate,
         clients,
-        // App-triggered batches (NOTIFICATION_RUN_ID) send the chosen period
-        // immediately — the cron's notice-date gate doesn't apply.
-        ignoreDueDate: existingRunId != null,
+        // App-triggered batches (NOTIFICATION_RUN_ID) and operator correction
+        // re-sends (resend) send the chosen period immediately — the cron's
+        // notice-date gate doesn't apply.
+        ignoreDueDate: existingRunId != null || resend,
     });
 
     // Cohort filter: when accountIds is a non-empty list, the run is scoped
@@ -1329,7 +1343,22 @@ export async function runDuePrePushNotifications({
             mode: PRE_PUSH_MODE,
             targets,
             excludedTagKeys: senderConfig.excludedTagKeys,
+            skipAlreadySent: resend,
         });
+        // eligibility.summary covers the whole period. When a cohort filter
+        // (accountIds) is active, report counts scoped to the cohort — else
+        // "eligible" reflects the entire period, not this batch.
+        const reportSummary = accountIdSet
+            ? eligibility.targets.reduce((acc, t) => {
+                if (!accountIdSet.has(String(t.masterAccountId))) return acc;
+                const bucket = {
+                    eligible: 'eligible', no_email: 'noEmail', unsubscribed: 'unsubscribed',
+                    already_sent: 'alreadySent', excluded_tag: 'excludedTag',
+                }[t.eligibility];
+                if (bucket) acc[bucket] += 1;
+                return acc;
+            }, { eligible: 0, noEmail: 0, unsubscribed: 0, alreadySent: 0, excludedTag: 0 })
+            : eligibility.summary;
         let selectedIds = eligibility.targets
             .filter((target) => target.eligibility === 'eligible')
             .filter((target) => accountIdSet == null || accountIdSet.has(String(target.masterAccountId)))
@@ -1349,21 +1378,21 @@ export async function runDuePrePushNotifications({
             planId: batch.plan?.id ? String(batch.plan.id) : duePeriod.planId,
             batchAccountCount: batch.summary.totalAccounts,
             batchSubscriptionCount: batch.summary.totalSubscriptions,
-            eligible: eligibility.summary.eligible,
-            noEmail: eligibility.summary.noEmail,
-            unsubscribed: eligibility.summary.unsubscribed,
-            alreadySent: eligibility.summary.alreadySent,
-            excludedTag: eligibility.summary.excludedTag,
+            eligible: reportSummary.eligible,
+            noEmail: reportSummary.noEmail,
+            unsubscribed: reportSummary.unsubscribed,
+            alreadySent: reportSummary.alreadySent,
+            excludedTag: reportSummary.excludedTag,
             sent: 0,
             failed: 0,
             status: selectedIds.length > 0 ? 'ready' : 'skipped_no_eligible_targets',
         };
 
-        summary.eligible += eligibility.summary.eligible;
-        summary.noEmail += eligibility.summary.noEmail;
-        summary.unsubscribed += eligibility.summary.unsubscribed;
-        summary.alreadySent += eligibility.summary.alreadySent;
-        summary.excludedTag += eligibility.summary.excludedTag;
+        summary.eligible += reportSummary.eligible;
+        summary.noEmail += reportSummary.noEmail;
+        summary.unsubscribed += reportSummary.unsubscribed;
+        summary.alreadySent += reportSummary.alreadySent;
+        summary.excludedTag += reportSummary.excludedTag;
         summary.processedPeriodCount++;
 
         const selectedIdSet = new Set(selectedIds.map(String));

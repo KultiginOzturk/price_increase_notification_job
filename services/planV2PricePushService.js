@@ -212,7 +212,8 @@ export async function buildPlanV2PricePushSource({ client, effectivePeriod }) {
             COALESCE(sd.current_price, 0) AS current_price,
             COALESCE(sd.new_price, 0) AS new_price,
             COALESCE(sd.increase_pct, 0) AS increase_pct,
-            COALESCE(sd.increase_dollar_annual, 0) AS increase_dollar_annual
+            COALESCE(sd.increase_dollar_annual, 0) AS increase_dollar_annual,
+            sd.pricing_tier
         FROM ${PLAN_TABLES.subscriptionDecision} sd
         INNER JOIN ${PLAN_TABLES.accountDecision} ad
             ON ad.id = sd.account_decision_id
@@ -317,6 +318,9 @@ export async function buildPlanV2PricePushSource({ client, effectivePeriod }) {
             serviceTypeName: meta.service_type_name || row.service_type_name || 'Unknown',
             isActive: meta.is_active === null || meta.is_active === undefined ? true : Boolean(meta.is_active),
             annualIncrease,
+            // Pipeline-computed square-footage tier (NULL = base rate) for the
+            // {square_footage_tier} email token.
+            pricingTier: row.pricing_tier || null,
         });
     }
 
