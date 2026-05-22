@@ -266,13 +266,22 @@ export async function sendReportFailureEmail({ recipients, reportName, client, e
 // ============================================
 
 /**
- * Replace {Variable} placeholders in a template string with values from a variables object.
- * Unrecognized variables are left as-is (e.g., {Foo} stays {Foo}).
+ * Replace {variable} placeholders in a template string.
+ *
+ * A referenced variable that is missing, null, or an empty string renders as
+ * an empty string — NEVER the raw {token} text, so customers can never see
+ * literal braces. Unknown variables (typos, dropped words) are logged so we
+ * can spot templates that need updating.
  */
 function resolveTemplateVariables(template, variables) {
   if (!template) return '';
   return template.replace(/\{(\w+)\}/g, (match, key) => {
-    return variables[key] !== undefined && variables[key] !== null ? String(variables[key]) : match;
+    const value = variables[key];
+    if (value === undefined) {
+      console.warn(`[EmailService] Template references unknown variable {${key}} — rendered as empty.`);
+      return '';
+    }
+    return value === null ? '' : String(value);
   });
 }
 
@@ -293,35 +302,59 @@ function formatSquareFootageTier(tier) {
 }
 
 /**
- * Map billing_frequency codes to human-readable labels and per-year counts.
- * Ported from DeliverAccounts.tsx billingInfo().
+ * Map a FieldRoutes billing_frequency (days between charges) to a human label
+ * and a charges-per-year count.
+ *
+ * Returns a NULL sentinel — { label: null, chargesPerYear: null } — when the
+ * cadence genuinely cannot be determined. This function NEVER throws and NEVER
+ * guesses monthly; callers decide how to degrade (see {service_list}).
+ *
+ * `isCount: true` marks a label derived from servicesPerYear ("4 times a year")
+ * rather than a real cadence — callers render it with different punctuation.
+ *
+ * @param {number|string|null} freq - billing_frequency in days; -1 = per visit
+ * @param {number|null} servicesPerYear
+ * @returns {{ label: string|null, chargesPerYear: number|null, isCount?: boolean }}
  */
 function billingFrequencyToLabel(freq, servicesPerYear = null) {
   const known = {
-    30:  { label: 'per month',          adjective: 'monthly',       chargesPerYear: 12 },
-    28:  { label: 'every 4 weeks',      adjective: 'every 4 weeks', chargesPerYear: 13 },
-    60:  { label: 'every other month',  adjective: 'bi-monthly',    chargesPerYear: 6 },
-    90:  { label: 'per quarter',        adjective: 'quarterly',     chargesPerYear: 4 },
-    180: { label: 'every 6 months',     adjective: 'semi-annually', chargesPerYear: 2 },
-    360: { label: 'per year',           adjective: 'annually',      chargesPerYear: 1 },
+    7:   { label: 'every week',        chargesPerYear: 52 },
+    14:  { label: 'every other week',  chargesPerYear: 26 },
+    28:  { label: 'every 4 weeks',     chargesPerYear: 13 },
+    29:  { label: 'every month',       chargesPerYear: 12 },
+    30:  { label: 'every month',       chargesPerYear: 12 },
+    31:  { label: 'every month',       chargesPerYear: 12 },
+    60:  { label: 'every other month', chargesPerYear: 6 },
+    90:  { label: 'every quarter',     chargesPerYear: 4 },
+    91:  { label: 'every quarter',     chargesPerYear: 4 },
+    180: { label: 'every 6 months',    chargesPerYear: 2 },
+    360: { label: 'every year',        chargesPerYear: 1 },
   };
 
-  if (freq != null && known[freq]) return known[freq];
-
-  // Per-visit codes
-  if (freq === -1 || freq === 0) {
-    return { label: 'per visit', adjective: 'per visit', chargesPerYear: servicesPerYear || null };
+  const code = freq == null ? null : Number(freq);
+  if (code != null && Number.isFinite(code) && known[code]) {
+    return { ...known[code] };
   }
 
-  // Fallback: try to derive from servicesPerYear
-  if (servicesPerYear && servicesPerYear > 0) {
-    if (servicesPerYear >= 11 && servicesPerYear <= 13)  return { label: 'per month',      adjective: 'monthly',       chargesPerYear: servicesPerYear };
-    if (servicesPerYear >= 3 && servicesPerYear <= 4)    return { label: 'per quarter',    adjective: 'quarterly',     chargesPerYear: servicesPerYear };
-    if (servicesPerYear === 1)                           return { label: 'per year',       adjective: 'annually',      chargesPerYear: 1 };
-    if (servicesPerYear === 2)                           return { label: 'every 6 months', adjective: 'semi-annually', chargesPerYear: 2 };
+  // -1 is FieldRoutes' explicit per-visit code. 0 means "not configured" — it
+  // is NOT per-visit, so it falls through to the servicesPerYear path below.
+  if (code === -1) {
+    return { label: 'every visit', chargesPerYear: Number(servicesPerYear) || null };
   }
 
-  return { label: 'per service', adjective: 'per service', chargesPerYear: null };
+  // Unknown / 0 / null frequency — fall back to the visit count if we have it.
+  // We describe the service count rather than inventing a cadence label.
+  const spy = Number(servicesPerYear) || 0;
+  if (spy > 0) {
+    return {
+      label: spy === 1 ? 'once a year' : `${spy} times a year`,
+      chargesPerYear: spy,
+      isCount: true,
+    };
+  }
+
+  // Genuinely undetermined — never guess.
+  return { label: null, chargesPerYear: null };
 }
 
 /**
@@ -339,32 +372,33 @@ function billingFrequencyToLabel(freq, servicesPerYear = null) {
  * @returns {{ label: string, chargesPerYear: number|null }}
  */
 function computeDominantBillingFrequency(services) {
-    if (!Array.isArray(services) || services.length === 0) {
-        return { label: 'per month', chargesPerYear: 12 };
-    }
-    const counts = new Map();
-    for (const svc of services) {
-        const billing = billingFrequencyToLabel(
-            svc.billingFrequency ?? svc.billing_frequency,
-            svc.servicesPerYear ?? svc.services_per_year,
-        );
-        const key = `${billing.label}|${billing.chargesPerYear ?? 'null'}`;
-        const prev = counts.get(key) ?? { ...billing, count: 0 };
-        prev.count++;
-        counts.set(key, prev);
-    }
-    const sorted = [...counts.values()].sort((a, b) => {
-        if (b.count !== a.count) return b.count - a.count;
-        return (b.chargesPerYear ?? 0) - (a.chargesPerYear ?? 0);
-    });
-    return { label: sorted[0].label, chargesPerYear: sorted[0].chargesPerYear };
+  const counts = new Map();
+  for (const svc of services || []) {
+    const billing = billingFrequencyToLabel(
+      svc.billingFrequency ?? svc.billing_frequency,
+      svc.servicesPerYear ?? svc.services_per_year,
+    );
+    // Skip services whose cadence is undetermined — they can't vote.
+    if (billing.chargesPerYear == null) continue;
+    const key = String(billing.chargesPerYear);
+    const prev = counts.get(key) ?? { label: billing.label, chargesPerYear: billing.chargesPerYear, count: 0 };
+    prev.count++;
+    counts.set(key, prev);
+  }
+  // No service had a determinable cadence — return the null sentinel.
+  if (counts.size === 0) return { label: null, chargesPerYear: null };
+  const sorted = [...counts.values()].sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    return (b.chargesPerYear ?? 0) - (a.chargesPerYear ?? 0);
+  });
+  return { label: sorted[0].label, chargesPerYear: sorted[0].chargesPerYear };
 }
 
 const DEFAULT_TEMPLATE = {
   notification_subject: 'Your Service Summary - {company_name}',
   notification_greeting: 'Hi {first_name},',
-  notification_body_single: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about an upcoming service price change for {account_name}. Your service will increase by {increase} {time_unit}, effective {effective_date}.\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
-  notification_body_multi: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about an upcoming service price change for {account_name}. Your services will increase by approximately {monthly_increase} per month, effective {effective_date}.\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
+  notification_body_single: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about an upcoming price change for {account_name}, effective {effective_date}:\n\n{service_list}\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
+  notification_body_multi: 'Thank you for trusting {company_name} with your pest management needs. We truly value your business.\n\nWe are writing to let you know about upcoming price changes for {account_name}, effective {effective_date}:\n\n{service_list}\n\nThese updated rates reflect the continued investment in quality products, trained technicians, and reliable scheduling that keep your property protected year-round.',
   notification_closing: "We're always here if you have any questions — feel free to reach out to us at any time.\n\nThank you for being a valued part of the {company_name} family.\n\nWarm regards,\nThe {company_name} Team",
   notification_footer: 'You are receiving this because you are a customer of {company_name}.',
   notification_header_color: '#0f172a',
@@ -372,8 +406,25 @@ const DEFAULT_TEMPLATE = {
 };
 
 /**
+ * Resolve a customer-facing account name. Falls back to "your account" when the
+ * name is missing or is a bare master_account_id (digits only) — a raw numeric
+ * id should never appear in a customer email.
+ */
+function resolveAccountName(accountName) {
+  const name = String(accountName ?? '').trim();
+  if (!name || /^\d+$/.test(name)) return 'your account';
+  return name;
+}
+
+/**
  * Compute template variables from services + account metadata.
- * Returns { mode: 'single'|'multi', variables: {...} }
+ *
+ * This function is TOTAL — it never throws. Every variable resolves to a string
+ * or to null (the renderer turns null into an empty string). Bad billing data
+ * on one service can make a cadence-dependent aggregate null, but it never
+ * aborts the email or blocks unrelated variables like {service_list}.
+ *
+ * @returns {{ mode: 'single'|'multi', variables: Object }}
  */
 export function computeEmailVariables({
   services,
@@ -382,72 +433,78 @@ export function computeEmailVariables({
   accountName,
   companyName,
   effectiveDate,
+  effectivePeriod = null,
   templateConfig = {},
 }) {
   const formatUSD = (val) => `$${Number(val).toFixed(2)}`;
-  const formatDate = (value) => {
-    if (!value) return '';
-    const parsed = new Date(`${value}T00:00:00`);
-    if (Number.isNaN(parsed.getTime())) return value;
-    return parsed.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+
+  const parseDate = (value) => {
+    if (!value) return null;
+    const parsed = new Date(`${String(value).slice(0, 10)}T00:00:00`);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
   };
+  const formatDate = (value) => {
+    const parsed = parseDate(value);
+    return parsed
+      ? parsed.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+      : '';
+  };
+  // effective_date is stored as the day BEFORE rollout, so +1 day lands in the
+  // rollout month.
   const formatMonth = (value) => {
-    if (!value) return '';
-    const parsed = new Date(`${value}T00:00:00`);
-    if (Number.isNaN(parsed.getTime())) return value;
+    const parsed = parseDate(value);
+    if (!parsed) return '';
+    parsed.setDate(parsed.getDate() + 1);
     return parsed.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   };
+  // effective_period is YYYY-MM — already the rollout month, no +1 needed.
+  const monthFromPeriod = (period) => {
+    const m = /^(\d{4})-(\d{2})$/.exec(String(period ?? '').trim());
+    if (!m) return '';
+    const parsed = new Date(Number(m[1]), Number(m[2]) - 1, 1);
+    return Number.isNaN(parsed.getTime())
+      ? ''
+      : parsed.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  };
 
-  // Filter out zero-increase subscriptions for mode determination
-  const nonZeroServices = (services || []).filter(s => {
-    const inc = Number(s.increaseAmount) || 0;
-    return inc > 0;
-  });
+  // Only services with a real price increase appear in customer-facing output.
+  const nonZeroServices = (services || []).filter(s => (Number(s.increaseAmount) || 0) > 0);
 
-  // Build service_list: one line per subscription showing service type and NEW price
-  // e.g., "BiMonthly Pest — $79.50\nMonthly Mosquito — $45.00"
-  const serviceList = nonZeroServices
-    .map(svc => `${svc.serviceTypeName || svc.service_type_name || 'Service'} — ${formatUSD(Number(svc.newPrice) || 0)}`)
-    .join('\n');
+  // ── {service_list} — the primary compound word ──────────────────────────
+  // One line per increasing subscription: "Name — $price[ cadence]". Price is
+  // the new recurring charge (matches the customer's invoice). The cadence
+  // suffix degrades gracefully — omitted entirely when it can't be determined,
+  // so the customer always sees a correct price, never a wrong cadence.
+  const serviceList = nonZeroServices.map(svc => {
+    const name = svc.serviceTypeName || svc.service_type_name || 'your service';
+    const price = formatUSD(Number(svc.newPrice ?? svc.new_price) || 0);
+    const billing = billingFrequencyToLabel(
+      svc.billingFrequency ?? svc.billing_frequency,
+      svc.servicesPerYear ?? svc.services_per_year,
+    );
+    if (!billing.label) return `${name} — ${price}`;
+    // isCount labels ("4 times a year") read as a parenthetical, not a rate,
+    // so they take a comma; real cadence labels ("every month") attach directly.
+    return billing.isCount
+      ? `${name} — ${price}, ${billing.label}`
+      : `${name} — ${price} ${billing.label}`;
+  }).join('\n');
 
-  // Build service_list_and_times: like service_list but with billing frequency
-  // e.g., "BiMonthly Pest — $79.50 — per month\nMonthly Mosquito — $45.00 — per month"
-  const serviceListAndTimes = nonZeroServices
-    .map(svc => {
-      const name = svc.serviceTypeName || svc.service_type_name || 'Service';
-      const newPrice = Number(svc.newPrice) || 0;
-      const billing = billingFrequencyToLabel(
-        svc.billingFrequency ?? svc.billing_frequency,
-        svc.servicesPerYear ?? svc.services_per_year,
-      );
-      return `${name} — ${formatUSD(newPrice)} — ${billing.label}`;
-    })
-    .join('\n');
-
-  // Square-footage tier — unique set across increasing subs, formatted for display.
-  // Single tier → "3,001–4,000 sq ft". Multi distinct → "0–3,000 sq ft, 3,001–4,000 sq ft".
-  // Blank when no sub carries a tier.
+  // Square-footage tier — unique set across increasing subs. Blank when none.
   const uniqueTiers = [...new Set(
-    nonZeroServices
-      .map(s => s.pricingTier ?? s.pricing_tier)
-      .filter(Boolean)
+    nonZeroServices.map(s => s.pricingTier ?? s.pricing_tier).filter(Boolean)
   )];
   const squareFootageTier = uniqueTiers.map(formatSquareFootageTier).filter(Boolean).join(', ');
 
-  // Compute per-cadence aggregates across all non-zero subs — drives
-  // {monthly_increase}, {quarterly_increase}, and the four current/new totals.
-  //
-  // PREFERRED: use authoritative annualCurrent / annualNew / annualIncrease when
-  // passed down from the pipeline (planV2PricePushService sets these from
-  // sm.annual_revenue + increase_dollar_annual). Exact and avoids the cadence
-  // mismatch where a quarterly service billed monthly has per_visit × charges_per_year
-  // ≠ true annual.
-  //
-  // FALLBACK: reconstruct from per-cycle × servicesPerYear. Inherits the cadence
-  // caveat but matches prior behavior for callers that don't supply annuals.
+  // ── Annual aggregates ───────────────────────────────────────────────────
+  // PREFERRED: authoritative annualCurrent/annualNew/annualIncrease from the
+  // pipeline. FALLBACK: reconstruct from per-cycle price × charges-per-year.
+  // If a service has neither, the annual totals are unreliable and every
+  // cadence-derived aggregate resolves to null (omitted) — we never guess.
   let totalAnnualIncrease = 0;
   let totalAnnualCurrent = 0;
   let totalAnnualNew = 0;
+  let annualReliable = nonZeroServices.length > 0;
   for (const svc of nonZeroServices) {
     const annualCurrent = Number(svc.annualCurrent ?? svc.annual_current) || 0;
     const annualNew = Number(svc.annualNew ?? svc.annual_new) || 0;
@@ -456,85 +513,63 @@ export function computeEmailVariables({
     if (annualCurrent > 0 && annualNew > 0) {
       totalAnnualCurrent += annualCurrent;
       totalAnnualNew += annualNew;
-      totalAnnualIncrease += (annualIncrease > 0 ? annualIncrease : (annualNew - annualCurrent));
+      totalAnnualIncrease += annualIncrease > 0 ? annualIncrease : (annualNew - annualCurrent);
       continue;
     }
 
-    const inc = Number(svc.increaseAmount) || 0;
-    const current = Number(svc.currentPrice ?? svc.current_price) || 0;
-    const next = Number(svc.newPrice ?? svc.new_price) || 0;
-    let spy = Number(svc.servicesPerYear ?? svc.services_per_year) || 0;
-    if (!spy || spy <= 0) {
-      const billing = billingFrequencyToLabel(svc.billingFrequency ?? svc.billing_frequency);
-      spy = billing.chargesPerYear || 12;
+    // Fallback needs a charges-per-year multiplier we can trust. If billing
+    // frequency is undetermined, we refuse to guess — the aggregates go null.
+    const billing = billingFrequencyToLabel(
+      svc.billingFrequency ?? svc.billing_frequency,
+      svc.servicesPerYear ?? svc.services_per_year,
+    );
+    if (!billing.chargesPerYear || billing.chargesPerYear <= 0) {
+      annualReliable = false;
+      continue;
     }
-    totalAnnualIncrease += inc * spy;
-    totalAnnualCurrent += current * spy;
-    totalAnnualNew += next * spy;
+    totalAnnualIncrease += (Number(svc.increaseAmount) || 0) * billing.chargesPerYear;
+    totalAnnualCurrent += (Number(svc.currentPrice ?? svc.current_price) || 0) * billing.chargesPerYear;
+    totalAnnualNew += (Number(svc.newPrice ?? svc.new_price) || 0) * billing.chargesPerYear;
   }
 
-  const totalMonthlyIncrease = totalAnnualIncrease / 12;
-  const totalQuarterlyIncrease = totalAnnualIncrease / 4;
-  const currentMonthlyTotal = totalAnnualCurrent / 12;
-  const currentQuarterlyTotal = totalAnnualCurrent / 4;
-  const newMonthlyTotal = totalAnnualNew / 12;
-  const newQuarterlyTotal = totalAnnualNew / 4;
   const serviceCount = nonZeroServices.length;
-  const avgMonthlyIncrease = serviceCount > 0 ? totalMonthlyIncrease / serviceCount : 0;
-  const avgQuarterlyIncrease = serviceCount > 0 ? totalQuarterlyIncrease / serviceCount : 0;
 
-  // Per-cycle math (Step 7 fix to the hardcoded /4 bug).
-  // Quarterly-as-calendar-quarter (annual/4) is correct for time-equivalent
-  // expressions, but customers care about *their* billing cycle — a monthly-
-  // billed customer should see "$X / month", not "$Y / quarter".
-  const dominantFreq = computeDominantBillingFrequency(nonZeroServices);
-  const perCycleLabel = dominantFreq.label;
-  const perCycleChargesPerYear = dominantFreq.chargesPerYear || 12;
-  const perCycleIncrease = perCycleChargesPerYear > 0
-    ? totalAnnualIncrease / perCycleChargesPerYear
-    : totalMonthlyIncrease;
-  const currentPerCycleTotal = perCycleChargesPerYear > 0
-    ? totalAnnualCurrent / perCycleChargesPerYear
-    : currentMonthlyTotal;
-  const newPerCycleTotal = perCycleChargesPerYear > 0
-    ? totalAnnualNew / perCycleChargesPerYear
-    : newMonthlyTotal;
+  // Cadence-blind aggregates (annual ÷ a fixed divisor) — null when unreliable.
+  const aggMonthly = (annual) => (annualReliable ? formatUSD(annual / 12) : null);
+  const aggQuarterly = (annual) => (annualReliable ? formatUSD(annual / 4) : null);
 
-  // Base variables available in ALL templates (single + multi)
+  // Cadence-aware per-cycle aggregates, using the dominant billing frequency.
+  const dominant = computeDominantBillingFrequency(nonZeroServices);
+  const perCycleOk = annualReliable && dominant.chargesPerYear != null && dominant.chargesPerYear > 0;
+  const perCycle = (annual) => (perCycleOk ? formatUSD(annual / dominant.chargesPerYear) : null);
+
+  // Base variables available in single + multi mode.
   const baseVars = {
-    first_name: firstName || (customerName ? customerName.split(' ')[0] : ''),
+    first_name: firstName || (customerName ? String(customerName).split(' ')[0] : '') || 'there',
     customer_name: customerName || '',
-    account_name: accountName || '',
+    account_name: resolveAccountName(accountName),
     company_name: companyName || templateConfig.notification_from_name || '',
     effective_date: formatDate(effectiveDate),
-    effective_month: formatMonth(effectiveDate),
+    effective_month: effectiveDate ? formatMonth(effectiveDate) : monthFromPeriod(effectivePeriod),
     service_list: serviceList,
-    service_list_and_times: serviceListAndTimes,
-    address_list: '',
-    // Square-footage pricing tier (e.g. "3,001–4,000 sq ft" or comma-joined for mixed)
     square_footage_tier: squareFootageTier,
-    // Per-cadence aggregates — available in both modes
-    monthly_increase: formatUSD(totalMonthlyIncrease),
-    quarterly_increase: formatUSD(totalQuarterlyIncrease),
-    // Step 7 fix: per-cycle aggregates derived from the customer's actual
-    // billing frequency. Templates should prefer {per_cycle_increase} +
-    // {per_cycle_label} over the bare {monthly_increase} / {quarterly_increase}
-    // when they want to address the customer in the cadence they're billed in.
-    per_cycle_increase: formatUSD(perCycleIncrease),
-    per_cycle_label: perCycleLabel,
-    current_per_cycle_total: formatUSD(currentPerCycleTotal),
-    new_per_cycle_total: formatUSD(newPerCycleTotal),
-    current_monthly_total: formatUSD(currentMonthlyTotal),
-    current_quarterly_total: formatUSD(currentQuarterlyTotal),
-    new_monthly_total: formatUSD(newMonthlyTotal),
-    new_quarterly_total: formatUSD(newQuarterlyTotal),
-    // Service counts — service_count and subscription_count are aliases
     service_count: String(serviceCount),
-    subscription_count: String(serviceCount),
-    // Per-service averages
-    average_monthly_increase: formatUSD(avgMonthlyIncrease),
-    average_quarterly_increase: formatUSD(avgQuarterlyIncrease),
-    // Client business contact variables (from settings)
+    // Cadence-blind aggregates — kept for power users, null when unreliable.
+    monthly_increase: aggMonthly(totalAnnualIncrease),
+    quarterly_increase: aggQuarterly(totalAnnualIncrease),
+    current_monthly_total: aggMonthly(totalAnnualCurrent),
+    current_quarterly_total: aggQuarterly(totalAnnualCurrent),
+    new_monthly_total: aggMonthly(totalAnnualNew),
+    new_quarterly_total: aggQuarterly(totalAnnualNew),
+    average_quarterly_increase: (annualReliable && serviceCount > 0)
+      ? formatUSD(totalAnnualIncrease / 4 / serviceCount)
+      : null,
+    // Cadence-aware aggregates — preferred over the monthly/quarterly pair.
+    per_cycle_increase: perCycle(totalAnnualIncrease),
+    per_cycle_label: perCycleOk ? dominant.label : null,
+    current_per_cycle_total: perCycle(totalAnnualCurrent),
+    new_per_cycle_total: perCycle(totalAnnualNew),
+    // Client business contact (from settings).
     client_email: templateConfig.notification_client_email || '',
     client_phone: templateConfig.notification_client_phone || '',
     client_address: templateConfig.notification_client_address || '',
@@ -542,25 +577,17 @@ export function computeEmailVariables({
 
   if (nonZeroServices.length === 1) {
     const svc = nonZeroServices[0];
-    const billing = billingFrequencyToLabel(
-      svc.billingFrequency ?? svc.billing_frequency,
-      svc.servicesPerYear ?? svc.services_per_year
-    );
-    const increase = Number(svc.increaseAmount) || 0;
-
     return {
       mode: 'single',
       variables: {
         ...baseVars,
-        service_type_name: svc.serviceTypeName || svc.service_type_name || 'Service',
-        increase: formatUSD(increase),
-        new_price: formatUSD(Number(svc.newPrice) || 0),
-        time_unit: billing.label,
-        new_billing_frequency: billing.adjective,
+        increase: formatUSD(Number(svc.increaseAmount) || 0),
+        new_price: formatUSD(Number(svc.newPrice ?? svc.new_price) || 0),
       },
     };
   }
-
+  // Multi mode — single-sub-only words ({increase}, {new_price}) are absent, so
+  // the renderer omits them instead of leaking literal {tokens}.
   return { mode: 'multi', variables: { ...baseVars } };
 }
 
@@ -573,6 +600,7 @@ export async function sendPriceIncreaseEmail({
   services,
   subscriptions,
   effectiveDate,
+  effectivePeriod,
   unsubscribeUrl,
   fromEmail,
   fromName,
@@ -609,7 +637,7 @@ export async function sendPriceIncreaseEmail({
   return sendTemplatedEmail({
     recipient, recipientName: resolvedCustomerName, firstName, accountName,
     clientName, senderEmail, senderName, services: normalizedServices,
-    effectiveDate, unsubscribeUrl, branding, templateConfig: templateConfig || {},
+    effectiveDate, effectivePeriod, unsubscribeUrl, branding, templateConfig: templateConfig || {},
     replyTo, dryRun,
   });
 }
@@ -620,7 +648,7 @@ export async function sendPriceIncreaseEmail({
 async function sendTemplatedEmail({
   recipient, recipientName, firstName, accountName,
   clientName, senderEmail, senderName, services,
-  effectiveDate, unsubscribeUrl, branding, templateConfig,
+  effectiveDate, effectivePeriod, unsubscribeUrl, branding, templateConfig,
   replyTo, dryRun = false,
 }) {
   // Merge incoming config with defaults — configured values win
@@ -630,7 +658,7 @@ async function sendTemplatedEmail({
 
   const { mode, variables } = computeEmailVariables({
     services, customerName: recipientName, firstName, accountName,
-    companyName: senderName, effectiveDate, templateConfig,
+    companyName: senderName, effectiveDate, effectivePeriod, templateConfig,
   });
 
   // Resolve all template sections from the merged config
