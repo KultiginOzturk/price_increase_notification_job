@@ -9,7 +9,9 @@
   },
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check main.js && node --check lib/postgres.js && node --check services/priceIncreaseNotificationService.js && node --check services/planV2PricePushService.js && node --check services/emailService.js && node --check config/tables.js && node --check utils/bigquery.js && node --check utils/repricingScheduling.js && node --check routes/planV2/timing.js"
+    "verify-emails": "node verify-emails.js",
+    "sync-email-status": "node sync-email-status.js",
+    "check": "node --check index.js && node --check main.js && node --check verify-emails.js && node --check sync-email-status.js && node --check lib/postgres.js && node --check lib/emailHealth.js && node --check lib/cohort.js && node --check lib/accountTags.js && node --check services/priceIncreaseNotificationService.js && node --check services/planV2PricePushService.js && node --check services/emailService.js && node --check services/emailVerificationService.js && node --check services/mailerSendActivityService.js && node --check config/tables.js && node --check utils/bigquery.js && node --check utils/repricingScheduling.js && node --check routes/planV2/timing.js"
   },
   "dependencies": {
     "@google-cloud/bigquery": "^8.1.1",

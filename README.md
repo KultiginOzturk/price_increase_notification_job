@@ -19,9 +19,30 @@ Due rule:
 
 ## Repo layout
 
-- `index.js` loads `.env` from this repo root, then starts the job
-- `main.js` runs the job
+- `index.js` loads `.env` from this repo root, then dispatches to one of `main.js` / `verify-emails.js` / `sync-email-status.js` based on the `JOB_TASK` env var (default `send`)
+- `main.js` runs the send pipeline (the default `JOB_TASK=send`)
+- `verify-emails.js` verifies a cohort's recipient emails via MailerSend, then tags undeliverable accounts
+- `sync-email-status.js` pulls hard bounces / spam complaints from the MailerSend Activity API, then tags affected accounts
 - `lib/`, `services/`, `config/`, `utils/`, `routes/` contain the minimal runtime copied from the main app
+
+## Email deliverability jobs
+
+Two extra entry points feed the channel-routing system. Both are triggered on
+demand (same Cloud Run Jobs `:run` pattern as the send job) and write to
+`email_health` (address-level deliverability store, auto-created in Cloud SQL)
+and to `inp_account_tags` (reason-coded tags).
+
+- **`verify-emails.js`** — resolves the same recipient cohort the send job
+  builds, verifies each email through MailerSend (skipping addresses with a
+  cached verdict still inside `EMAIL_VERIFICATION_TTL_DAYS`), then reconciles
+  deliverability tags: `no_email`, `email_invalid`, `email_hard_bounced`,
+  `email_spam_complaint`.
+- **`sync-email-status.js`** — pulls `hard_bounced` / `spam_complaints` activity
+  into `email_health`, then (if a cohort is given) reconciles the same tags.
+  Re-run safe; bounces trickle in for days after a send, so re-run accordingly.
+
+Tag keys are registered via `migrations/002_deliverability_tag_definitions.sql`
+(apply manually — `cfg_tag_definitions` is app-owned config).
 
 ## Required environment
 
@@ -35,6 +56,12 @@ Due rule:
 
 Optional environment:
 
+- `JOB_TASK`
+  - Selects which entry point this container execution runs:
+    - `send` (default) — `main.js`, the send pipeline
+    - `verify` — `verify-emails.js`, cohort email verification + tagging
+    - `sync-status` — `sync-email-status.js`, MailerSend Activity ETL + tagging
+  - Pass it as a per-execution `containerOverrides.env` entry when invoking the Cloud Run Job, same shape as the existing `NOTIFICATION_*` overrides.
 - `NOTIFICATION_CLIENTS`
   - Comma-separated client list. If omitted, the job scans all clients with a published PlanV2 plan.
 - `NOTIFICATION_TARGET_DATE`
@@ -51,6 +78,23 @@ Optional environment:
   - Optional for local runs only if you are not using ADC.
 - `USE_ADC`
   - Optional. Set `true` locally to use `gcloud auth application-default login`.
+
+Optional environment for `verify-emails.js` / `sync-email-status.js`:
+
+- `EMAIL_VERIFICATION_TTL_DAYS`
+  - How long a MailerSend verification verdict is trusted before re-verifying. Default `90`.
+- `MAILERSEND_VERIFY_MAX_PER_MINUTE`
+  - In-process rate limit for the verification endpoint. Default `60`.
+- `EMAIL_STATUS_LOOKBACK_DAYS`
+  - Default lookback window for the Activity ETL. Default `30`.
+- `NOTIFICATION_STATUS_SINCE_DAYS`
+  - Per-run override of the Activity ETL lookback window.
+- `MAILERSEND_SYNC_DOMAINS`
+  - Comma-separated MailerSend domain ids/names to limit the Activity ETL to. Default: all domains.
+- `VERIFY_EMAILS`
+  - Ad-hoc: comma-separated addresses to verify directly, bypassing cohort resolution and tagging.
+- `EMAIL_VERIFY_FORCE`
+  - Set `true` to re-verify addresses even when a fresh cached verdict exists.
 
 ## Local run
 

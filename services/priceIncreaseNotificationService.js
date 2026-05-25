@@ -620,10 +620,15 @@ export async function fetchNotificationConfig(client) {
         if (value != null) templateConfig[key] = value;
     }
 
-    const excludedTagsRaw = settings.get('notification_excluded_tags')?.trim();
-    const excludedTagKeys = excludedTagsRaw
-        ? [...new Set(excludedTagsRaw.split(',').map((value) => value.trim()).filter(Boolean))]
-        : [];
+    // Excluded tags come from inp_tag_handling_rules (Cloud SQL) — the
+    // client-ops-pilot routing-rules system. Any tag whose effective routing
+    // for this client is 'physical_mail' or 'no_notification' is excluded
+    // from email send. Client-specific rules override global rules.
+    //
+    // Historical: this used to read the per-client `notification_excluded_tags`
+    // setting from inp_client_settings; that was replaced after migration 133
+    // so the email and physical-mail routing share one source of truth.
+    const excludedTagKeys = await fetchExcludedTagKeysForClient(client);
 
     return {
         fromEmail,
@@ -632,6 +637,43 @@ export async function fetchNotificationConfig(client) {
         templateConfig, // All notification_* settings as a flat object
         excludedTagKeys,
     };
+}
+
+/**
+ * Resolve the effective set of tag keys that exclude an account from email
+ * send for this client, by reading inp_tag_handling_rules.
+ *
+ * Routing precedence (mirrors client-ops-pilot's tag-handling-rules read):
+ *   1. client-specific rule (client = @client AND is_current)
+ *   2. global rule        (client IS NULL AND is_current)
+ *   3. default 'email'    (no rule → not excluded)
+ *
+ * A key is excluded when its effective routing is 'physical_mail' or
+ * 'no_notification'.
+ */
+async function fetchExcludedTagKeysForClient(client) {
+    const result = await pgQuery(`
+        WITH client_rules AS (
+            SELECT tag_type_key, notification_routing
+              FROM inp_tag_handling_rules
+             WHERE client = $1 AND is_current = TRUE
+        ),
+        global_rules AS (
+            SELECT tag_type_key, notification_routing
+              FROM inp_tag_handling_rules
+             WHERE client IS NULL AND is_current = TRUE
+        ),
+        effective AS (
+            SELECT COALESCE(cr.tag_type_key, gr.tag_type_key) AS tag_type_key,
+                   COALESCE(cr.notification_routing, gr.notification_routing) AS notification_routing
+              FROM client_rules cr
+              FULL OUTER JOIN global_rules gr USING (tag_type_key)
+        )
+        SELECT DISTINCT tag_type_key
+          FROM effective
+         WHERE notification_routing IN ('physical_mail', 'no_notification')
+    `, [client]);
+    return result.rows.map((row) => row.tag_type_key);
 }
 
 // Legacy alias for backward compatibility

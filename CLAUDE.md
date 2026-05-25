@@ -12,11 +12,13 @@ The runtime is **Node 20, ESM** (`"type": "module"` in [package.json](package.js
 
 | File | Purpose |
 | --- | --- |
-| [index.js](index.js) | Loads `.env` from project root, then imports `main.js`. The Docker `CMD` runs this. |
+| [index.js](index.js) | Loads `.env` from project root, then dispatches to one of `main.js` / `verify-emails.js` / `sync-email-status.js` based on `JOB_TASK` (default `send`). The Docker `CMD` runs this. |
 | [main.js](main.js) | The job. Reads env, calls `runDuePrePushNotifications`, runs interactive preflight, writes `send-report-*.xlsx`, exits non-zero on any send failure. |
 | [test-send-one.js](test-send-one.js) | Sends one hardcoded sample email to `TEST_TO`. Used to verify MailerSend / sender config end-to-end. |
 | [export-eligible.js](export-eligible.js) | Dry-run: dumps the eligible-target list for a client to xlsx without sending. |
 | [send-correction.js](send-correction.js) | One-off correction-email sender (a previous incident remediation script). Not part of the regular notification job. |
+| [verify-emails.js](verify-emails.js) | Resolves the send cohort, verifies recipient emails via MailerSend (TTL-cached in `email_health`), reconciles reason-coded deliverability tags into `inp_account_tags`. |
+| [sync-email-status.js](sync-email-status.js) | Pulls `hard_bounced` / `spam_complaints` from the MailerSend Activity API into `email_health`, then reconciles deliverability tags for the cohort. |
 
 The "real work" entry into the service layer is [`runDuePrePushNotifications`](services/priceIncreaseNotificationService.js#L941) — every entry point above ultimately funnels through it (or its sub-functions).
 
@@ -81,10 +83,11 @@ Plus runtime-only outcomes appended to `sendStatus`: `skipped_send_limit`, `fail
 - `notification_from_address` — full email or local-part (combined with `notification_from_domain` or `MAILERSEND_FROM_DOMAIN`)
 - `notification_from_domain`
 - `notification_from_name`
-- `notification_excluded_tags` — comma-separated list of tag keys; matched accounts get `excluded_tag`
 - All other `notification_*` keys are passed through as `templateConfig` to `emailService` for template substitution
 
 Reply-to falls back to `NOTIFICATION_REPLY_TO_FALLBACK` (or `nate@pestnotifications.com`) when the client hasn't configured a verified address.
+
+The list of tag keys that exclude an account from email send is NOT in `inp_client_settings` anymore — it's derived from `inp_tag_handling_rules` in Cloud SQL. `fetchExcludedTagKeysForClient(client)` reads that table with client-specific rules overriding global rules, returning every `tag_type_key` whose effective `notification_routing` is `physical_mail` or `no_notification`. The legacy `notification_excluded_tags` setting is no longer read; manage routing in the client-ops-pilot tag-handling-rules UI instead.
 
 ## Scripts directory
 
